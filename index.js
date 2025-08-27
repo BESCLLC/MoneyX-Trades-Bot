@@ -1,3 +1,5 @@
+// MoneyX Trades TG Bot — Railway-ready (schema-aligned + proper collateral USD)
+
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -21,7 +23,7 @@ if (!TG_BOT_TOKEN || !TG_CHAT_ID || !SUBGRAPH_URL) {
 
 const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
 
-// ---------- State: Redis (preferred) or file fallback ----------
+// ---------- State ----------
 let useRedis = false;
 let redis = null;
 if (REDIS_URL) {
@@ -35,88 +37,70 @@ if (REDIS_URL) {
   }
 }
 const STATE_FILE = path.join(__dirname, 'state.json');
-
 async function loadState() {
-  if (useRedis) {
-    const lastTs = Number(await redis.get('mx:lastTs')) || 0;
-    return { lastTs };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  } catch {
-    return { lastTs: 0 };
-  }
+  if (useRedis) return { lastTs: Number(await redis.get('mx:lastTs')) || 0 };
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
+  catch { return { lastTs: 0 }; }
 }
 async function saveState(state) {
-  if (useRedis) {
-    await redis.set('mx:lastTs', String(state.lastTs || 0));
-  } else {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  }
+  if (useRedis) await redis.set('mx:lastTs', String(state.lastTs || 0));
+  else fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
-async function markSeen(ts, id) {
-  if (useRedis) await redis.sadd(`mx:seen:${ts}`, id);
-}
-async function alreadySeen(ts, id) {
-  if (useRedis) return (await redis.sismember(`mx:seen:${ts}`, id)) === 1;
-  return false;
-}
-async function rotateSeen(oldTs, newTs) {
-  if (useRedis && newTs > oldTs) await redis.del(`mx:seen:${oldTs}`);
-}
+async function markSeen(ts, id) { if (useRedis) await redis.sadd(`mx:seen:${ts}`, id); }
+async function alreadySeen(ts, id) { return useRedis ? (await redis.sismember(`mx:seen:${ts}`, id)) === 1 : false; }
+async function rotateSeen(oldTs, newTs) { if (useRedis && newTs > oldTs) await redis.del(`mx:seen:${oldTs}`); }
 
 // ---------- Helpers ----------
 const FIRST = 50;
 const scale1e30 = (v) => Number(v) / 1e30;
 const scale1e18 = (v) => Number(v) / 1e18;
-
 const short = (addr) => (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : '');
 const fmtUsd = (v) => (v == null ? '—' : `$${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const fmtPrice = (p) => (p == null ? '—' : p.toLocaleString(undefined, { maximumFractionDigits: 2 }));
 const calcLev = (sizeUsd, collUsd) => (!sizeUsd || !collUsd ? '—' : (sizeUsd / collUsd).toFixed(1) + 'x');
 const linkTx = (tx) => (!tx || !EXPLORER_TX_BASE ? '' : `\n🔗 tx: ${EXPLORER_TX_BASE}${tx}`);
 
-// ---------- GraphQL queries (schema-aligned) ----------
+// ---------- Chainlink price fetch ----------
+async function getTokenPriceUsd(tokenAddr) {
+  try {
+    const q = `
+      query {
+        chainlinkPrices(first:1, orderBy:timestamp, orderDirection:desc, where:{token:"${tokenAddr.toLowerCase()}"}) {
+          value
+        }
+      }`;
+    const res = await axios.post(SUBGRAPH_URL, { query: q });
+    const val = res.data.data?.chainlinkPrices?.[0]?.value;
+    if (!val) return null;
+    return scale1e30(val); // USD price
+  } catch (e) {
+    console.error("Price fetch failed:", e.message);
+    return null;
+  }
+}
+
+// ---------- GraphQL queries ----------
 const QUERIES = [
   {
     type: 'Increase',
     key: 'createIncreasePositions',
     query: `
       query ($since: BigInt!, $first: Int!) {
-        createIncreasePositions(
-          first: $first,
-          orderBy: timestamp,
-          orderDirection: asc,
-          where: { timestamp_gt: $since }
-        ) {
-          id
-          account
-          indexToken
-          collateralToken
-          isLong
-          sizeDelta
-          amountIn
-          acceptablePrice
-          transaction
-          timestamp
+        createIncreasePositions(first: $first, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: $since }) {
+          id account indexToken collateralToken isLong sizeDelta amountIn acceptablePrice transaction timestamp
         }
-      }
-    `,
-    map: (r) => {
-      const size = scale1e30(r.sizeDelta);
-      const coll = scale1e18(r.amountIn);
-      const price = scale1e30(r.acceptablePrice);
+      }`,
+    map: async (r) => {
+      const sizeUsd = scale1e30(r.sizeDelta);
+      const tokenPrice = await getTokenPriceUsd(r.collateralToken);
+      const amount = scale1e18(r.amountIn);
+      const collUsd = tokenPrice ? amount * tokenPrice : 0;
       return {
-        id: r.id,
-        account: r.account,
-        indexToken: r.indexToken,
-        isLong: r.isLong,
-        size,
-        collateral: coll,
-        leverage: calcLev(size, coll),
-        price,
-        tx: r.transaction,
-        timestamp: Number(r.timestamp),
+        id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong,
+        size: sizeUsd, collateral: collUsd,
+        leverage: calcLev(sizeUsd, collUsd),
+        price: scale1e30(r.acceptablePrice),
+        tx: r.transaction, timestamp: Number(r.timestamp),
       };
     },
   },
@@ -125,89 +109,45 @@ const QUERIES = [
     key: 'createDecreasePositions',
     query: `
       query ($since: BigInt!, $first: Int!) {
-        createDecreasePositions(
-          first: $first,
-          orderBy: timestamp,
-          orderDirection: asc,
-          where: { timestamp_gt: $since }
-        ) {
-          id
-          account
-          indexToken
-          collateralToken
-          isLong
-          sizeDelta
-          acceptablePrice
-          executionFee
-          transaction
-          timestamp
+        createDecreasePositions(first: $first, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: $since }) {
+          id account indexToken collateralToken isLong sizeDelta acceptablePrice executionFee transaction timestamp
         }
-      }
-    `,
-    map: (r) => {
-      const size = scale1e30(r.sizeDelta);
-      const price = scale1e30(r.acceptablePrice);
-      return {
-        id: r.id,
-        account: r.account,
-        indexToken: r.indexToken,
-        isLong: r.isLong,
-        size,
-        collateral: null,
-        leverage: '—',
-        price,
-        tx: r.transaction,
-        timestamp: Number(r.timestamp),
-      };
-    },
+      }`,
+    map: async (r) => ({
+      id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong,
+      size: scale1e30(r.sizeDelta), collateral: null,
+      leverage: '—',
+      price: scale1e30(r.acceptablePrice),
+      tx: r.transaction, timestamp: Number(r.timestamp),
+    }),
   },
   {
     type: 'Liquidation',
     key: 'liquidatedPositions',
     query: `
       query ($since: BigInt!, $first: Int!) {
-        liquidatedPositions(
-          first: $first,
-          orderBy: timestamp,
-          orderDirection: asc,
-          where: { timestamp_gt: $since }
-        ) {
-          id
-          account
-          indexToken
-          isLong
-          size
-          collateral
-          markPrice
-          averagePrice
-          loss
-          timestamp
+        liquidatedPositions(first: $first, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: $since }) {
+          id account indexToken isLong size collateral markPrice averagePrice loss timestamp collateralToken
         }
-      }
-    `,
-    map: (r) => {
-      const size = scale1e30(r.size);
+      }`,
+    map: async (r) => {
+      const sizeUsd = scale1e30(r.size);
+      const tokenPrice = await getTokenPriceUsd(r.collateralToken);
       const coll = scale1e18(r.collateral);
-      const price = scale1e30(r.markPrice);
-      const lev = calcLev(size, coll);
+      const collUsd = tokenPrice ? coll * tokenPrice : 0;
       return {
-        id: r.id,
-        account: r.account,
-        indexToken: r.indexToken,
-        isLong: r.isLong,
-        size,
-        collateral: coll,
-        leverage: lev,
-        price,
+        id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong,
+        size: sizeUsd, collateral: collUsd, leverage: calcLev(sizeUsd, collUsd),
+        price: scale1e30(r.markPrice),
         avgPrice: scale1e30(r.averagePrice),
         loss: scale1e30(r.loss),
-        tx: null,
-        timestamp: Number(r.timestamp),
+        tx: null, timestamp: Number(r.timestamp),
       };
     },
   },
 ];
 
+// ---------- Renderer ----------
 function renderMessage(type, rec) {
   const isLiq = type === 'Liquidation';
   const directionEmoji = rec.isLong ? '🟢 LONG' : '🔴 SHORT';
@@ -227,53 +167,38 @@ function renderMessage(type, rec) {
     if (rec.avgPrice != null) lines.push(`• Avg Entry: ${fmtPrice(rec.avgPrice)}`);
     if (rec.loss != null) lines.push(`• Loss: ${fmtUsd(rec.loss)}`);
   }
-
   return lines.join('\n') + (rec.tx ? linkTx(rec.tx) : '');
 }
 
+// ---------- Runner ----------
 async function fetchBlock(q, sinceTs) {
-  const res = await axios.post(
-    SUBGRAPH_URL,
-    { query: q.query, variables: { since: String(sinceTs), first: FIRST } },
-    { timeout: 20000 }
-  );
+  const res = await axios.post(SUBGRAPH_URL, { query: q.query, variables: { since: String(sinceTs), first: FIRST } });
   if (res.data.errors) return [];
   const items = res.data.data?.[q.key] ?? [];
-  if (!items.length) return [];
   items.sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
-  return items.map(q.map);
+  const mapped = [];
+  for (const it of items) mapped.push(await q.map(it));
+  return mapped;
 }
 
 async function runOnce(state) {
   const minSize = Number(MIN_SIZE_USD) || 0;
   let newestTs = state.lastTs || 0;
-
   for (const q of QUERIES) {
     try {
       const items = await fetchBlock(q, state.lastTs || 0);
-      if (!items.length) continue;
-
       for (const rec of items) {
         const ts = rec.timestamp;
         if (ts < (state.lastTs || 0)) continue;
         if (await alreadySeen(ts, rec.id)) continue;
+        if ((rec.size || 0) < minSize) { await markSeen(ts, rec.id); continue; }
 
-        if ((rec.size || 0) < minSize) {
-          await markSeen(ts, rec.id);
-          continue;
-        }
-
-        const msg = renderMessage(q.type, rec);
-        await bot.sendMessage(TG_CHAT_ID, msg, { disable_web_page_preview: true });
-
+        await bot.sendMessage(TG_CHAT_ID, renderMessage(q.type, rec), { disable_web_page_preview: true });
         await markSeen(ts, rec.id);
         if (ts > newestTs) newestTs = ts;
       }
-    } catch (e) {
-      console.error(`[${q.type}] query failed:`, e?.response?.data || e.message);
-    }
+    } catch (e) { console.error(`[${q.type}]`, e?.response?.data || e.message); }
   }
-
   if (newestTs > (state.lastTs || 0)) {
     const old = state.lastTs || 0;
     state.lastTs = newestTs;
@@ -287,47 +212,28 @@ async function runOnce(state) {
   console.log('🚀 MoneyX TG bot started. Polling:', SUBGRAPH_URL);
   let state = await loadState();
 
-  // On first boot, dump last 5 increase trades
+  // Startup sanity check: last 5 increases
   try {
     const res = await axios.post(SUBGRAPH_URL, {
-      query: `
-        {
-          createIncreasePositions(first: 5, orderBy: timestamp, orderDirection: desc) {
-            id
-            account
-            indexToken
-            isLong
-            sizeDelta
-            amountIn
-            acceptablePrice
-            transaction
-            timestamp
-          }
-        }
-      `
+      query: `{ createIncreasePositions(first:5, orderBy:timestamp, orderDirection:desc) {
+        id account indexToken isLong sizeDelta amountIn acceptablePrice transaction timestamp collateralToken } }`
     });
-    const recs = res.data.data.createIncreasePositions;
-    if (recs && recs.length) {
-      recs.reverse().forEach(r => {
-        const size = scale1e30(r.sizeDelta);
-        const coll = scale1e18(r.amountIn);
-        const lev  = calcLev(size, coll);
-        const price = scale1e30(r.acceptablePrice);
-        const msg =
-`🧪 STARTUP LAST 5 
+    for (const r of res.data.data.createIncreasePositions.reverse()) {
+      const size = scale1e30(r.sizeDelta);
+      const tokenPrice = await getTokenPriceUsd(r.collateralToken);
+      const coll = scale1e18(r.amountIn);
+      const collUsd = tokenPrice ? coll * tokenPrice : 0;
+      const lev = calcLev(size, collUsd);
+      const price = scale1e30(r.acceptablePrice);
+      await bot.sendMessage(TG_CHAT_ID,
+`🧪 STARTUP LAST 5 TRADES
 • Wallet: ${short(r.account)}
 • Size: ${fmtUsd(size)}
-• Collateral: ${fmtUsd(coll)}
+• Collateral: ${fmtUsd(collUsd)}
 • Leverage: ${lev}
-• Price: ${fmtPrice(price)}`;
-        bot.sendMessage(TG_CHAT_ID, msg);
-      });
+• Price: ${fmtPrice(price)}`);
     }
-  } catch (e) {
-    console.error('Startup dump failed', e.message);
-  }
+  } catch (e) { console.error('Startup dump failed', e.message); }
 
-  setInterval(async () => {
-    state = await runOnce(state);
-  }, Number(POLL_INTERVAL_MS));
+  setInterval(async () => { state = await runOnce(state); }, Number(POLL_INTERVAL_MS));
 })();
