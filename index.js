@@ -9,7 +9,6 @@ const {
   TG_CHAT_ID,
   SUBGRAPH_URL,
   POLL_INTERVAL_MS = '15000',
-  SCALE_1E30 = 'true',
   MIN_SIZE_USD = '0',
   EXPLORER_TX_BASE = '',
   REDIS_URL,
@@ -68,11 +67,9 @@ async function rotateSeen(oldTs, newTs) {
 
 // ---------- Helpers ----------
 const FIRST = 50;
-const scale = (v) => {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return 0;
-  return (SCALE_1E30 === 'true') ? n / 1e30 : n;
-};
+const scale1e30 = (v) => Number(v) / 1e30;
+const scale1e18 = (v) => Number(v) / 1e18;
+
 const short = (addr) => (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : '');
 const fmtUsd = (v) => (v == null ? '—' : `$${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
 const fmtPrice = (p) => (p == null ? '—' : p.toLocaleString(undefined, { maximumFractionDigits: 2 }));
@@ -106,9 +103,9 @@ const QUERIES = [
       }
     `,
     map: (r) => {
-      const size = scale(r.sizeDelta);
-      const coll = scale(r.amountIn);
-      const price = scale(r.acceptablePrice);
+      const size = scale1e30(r.sizeDelta);
+      const coll = scale1e18(r.amountIn);
+      const price = scale1e30(r.acceptablePrice);
       return {
         id: r.id,
         account: r.account,
@@ -148,8 +145,8 @@ const QUERIES = [
       }
     `,
     map: (r) => {
-      const size = scale(r.sizeDelta);
-      const price = scale(r.acceptablePrice);
+      const size = scale1e30(r.sizeDelta);
+      const price = scale1e30(r.acceptablePrice);
       return {
         id: r.id,
         account: r.account,
@@ -176,7 +173,6 @@ const QUERIES = [
           where: { timestamp_gt: $since }
         ) {
           id
-          key
           account
           indexToken
           isLong
@@ -190,9 +186,9 @@ const QUERIES = [
       }
     `,
     map: (r) => {
-      const size = scale(r.size);
-      const coll = scale(r.collateral);
-      const price = scale(r.markPrice);
+      const size = scale1e30(r.size);
+      const coll = scale1e18(r.collateral);
+      const price = scale1e30(r.markPrice);
       const lev = calcLev(size, coll);
       return {
         id: r.id,
@@ -203,8 +199,8 @@ const QUERIES = [
         collateral: coll,
         leverage: lev,
         price,
-        avgPrice: scale(r.averagePrice),
-        loss: scale(r.loss),
+        avgPrice: scale1e30(r.averagePrice),
+        loss: scale1e30(r.loss),
         tx: null,
         timestamp: Number(r.timestamp),
       };
@@ -291,7 +287,7 @@ async function runOnce(state) {
   console.log('🚀 MoneyX TG bot started. Polling:', SUBGRAPH_URL);
   let state = await loadState();
 
-  // On first boot, dump last 5 increase trades as a sanity check
+  // On first boot, dump last 5 increase trades
   try {
     const res = await axios.post(SUBGRAPH_URL, {
       query: `
@@ -313,12 +309,12 @@ async function runOnce(state) {
     const recs = res.data.data.createIncreasePositions;
     if (recs && recs.length) {
       recs.reverse().forEach(r => {
-        const size = scale(r.sizeDelta);
-        const coll = scale(r.amountIn);
+        const size = scale1e30(r.sizeDelta);
+        const coll = scale1e18(r.amountIn);
         const lev  = calcLev(size, coll);
-        const price = scale(r.acceptablePrice);
+        const price = scale1e30(r.acceptablePrice);
         const msg =
-`🧪 STARTUP TEST
+`🧪 STARTUP LAST 5 
 • Wallet: ${short(r.account)}
 • Size: ${fmtUsd(size)}
 • Collateral: ${fmtUsd(coll)}
@@ -331,7 +327,6 @@ async function runOnce(state) {
     console.error('Startup dump failed', e.message);
   }
 
-  // Begin normal polling loop
   setInterval(async () => {
     state = await runOnce(state);
   }, Number(POLL_INTERVAL_MS));
