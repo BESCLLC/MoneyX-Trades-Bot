@@ -93,9 +93,9 @@ async function fetchUserStat(account) {
   } }`;
   try {
     const res = await axios.post(SUBGRAPH_URL, { query: q });
-    return res.data.data.userStat || null;
+    return res.data?.data?.userStat || null;
   } catch (e) {
-    console.error("userStat fetch error:", e.message);
+    console.error('userStat fetch error:', e.message);
     return null;
   }
 }
@@ -147,29 +147,49 @@ async function fetchIncrease(since) {
   const q = `{ createIncreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
     id account indexToken collateralToken isLong sizeDelta amountIn acceptablePrice transaction timestamp
   } }`;
-  const res = await axios.post(SUBGRAPH_URL, { query: q });
-  return res.data.data.createIncreasePositions || [];
+  try {
+    const res = await axios.post(SUBGRAPH_URL, { query: q });
+    return res.data?.data?.createIncreasePositions || [];
+  } catch (e) {
+    console.error('fetchIncrease error:', e.message);
+    return [];
+  }
 }
 async function fetchDecrease(since) {
   const q = `{ createDecreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
     id account indexToken collateralToken isLong sizeDelta acceptablePrice transaction timestamp
   } }`;
-  const res = await axios.post(SUBGRAPH_URL, { query: q });
-  return res.data.data.createDecreasePositions || [];
+  try {
+    const res = await axios.post(SUBGRAPH_URL, { query: q });
+    return res.data?.data?.createDecreasePositions || [];
+  } catch (e) {
+    console.error('fetchDecrease error:', e.message);
+    return [];
+  }
 }
 async function fetchLiquidations(since) {
   const q = `{ liquidatedPositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
     id account indexToken collateralToken isLong size collateral markPrice averagePrice loss timestamp
   } }`;
-  const res = await axios.post(SUBGRAPH_URL, { query: q });
-  return res.data.data.liquidatedPositions || [];
+  try {
+    const res = await axios.post(SUBGRAPH_URL, { query: q });
+    return res.data?.data?.liquidatedPositions || [];
+  } catch (e) {
+    console.error('fetchLiquidations error:', e.message);
+    return [];
+  }
 }
 async function fetchActivePosition(account, indexToken, isLong) {
   const q = `{ activePositions(where: { account: "${account}", indexToken: "${indexToken}", isLong: ${isLong} }) {
     averagePrice size collateral
   } }`;
-  const res = await axios.post(SUBGRAPH_URL, { query: q });
-  return res.data.data.activePositions?.[0] || null;
+  try {
+    const res = await axios.post(SUBGRAPH_URL, { query: q });
+    return res.data?.data?.activePositions?.[0] || null;
+  } catch (e) {
+    console.error('fetchActivePosition error:', e.message);
+    return null;
+  }
 }
 
 // ---------- Handlers ----------
@@ -179,9 +199,17 @@ async function handleIncrease(r) {
   const price = await getTokenPriceUsd(r.collateralToken);
   const collUsd = price ? collAmount * price : 0;
   return {
-    id: r.id, account: r.account, indexToken: r.indexToken, collateralToken: r.collateralToken, isLong: r.isLong,
-    size, collateral: collUsd, leverage: calcLev(size, collUsd),
-    price: scale1e30(r.acceptablePrice), tx: r.transaction, timestamp: Number(r.timestamp),
+    id: r.id,
+    account: r.account,
+    indexToken: r.indexToken,
+    collateralToken: r.collateralToken,
+    isLong: r.isLong,
+    size,
+    collateral: collUsd,
+    leverage: calcLev(size, collUsd),
+    price: scale1e30(r.acceptablePrice),
+    tx: r.transaction,
+    timestamp: Number(r.timestamp),
   };
 }
 
@@ -194,12 +222,21 @@ async function handleDecrease(r) {
   const current = await getTokenPriceUsd(r.indexToken);
   if (!entry || !current) return null;
 
-  const delta = r.isLong ? (current - entry) : (entry - current);
+  const delta = r.isLong ? current - entry : entry - current;
   const pnlUsd = (delta / entry) * size;
   const collUsd = scale1e30(active.collateral);
   const pnlPct = collUsd ? (pnlUsd / collUsd) * 100 : 0;
 
-  return { id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong, pnlUsd, pnlPct, size, timestamp: Number(r.timestamp) };
+  return {
+    id: r.id,
+    account: r.account,
+    indexToken: r.indexToken,
+    isLong: r.isLong,
+    pnlUsd,
+    pnlPct,
+    size,
+    timestamp: Number(r.timestamp),
+  };
 }
 
 async function handleLiquidation(r) {
@@ -208,10 +245,18 @@ async function handleLiquidation(r) {
   const price = await getTokenPriceUsd(r.collateralToken);
   const collUsd = price ? collAmount * price : 0;
   return {
-    id: r.id, account: r.account, indexToken: r.indexToken, collateralToken: r.collateralToken, isLong: r.isLong,
-    size, collateral: collUsd, leverage: calcLev(size, collUsd),
-    price: scale1e30(r.markPrice), avgPrice: scale1e30(r.averagePrice),
-    loss: scale1e30(r.loss), timestamp: Number(r.timestamp),
+    id: r.id,
+    account: r.account,
+    indexToken: r.indexToken,
+    collateralToken: r.collateralToken,
+    isLong: r.isLong,
+    size,
+    collateral: collUsd,
+    leverage: calcLev(size, collUsd),
+    price: scale1e30(r.markPrice),
+    avgPrice: scale1e30(r.averagePrice),
+    loss: scale1e30(r.loss),
+    timestamp: Number(r.timestamp),
   };
 }
 
@@ -226,7 +271,7 @@ async function runOnce() {
     const stats = await fetchUserStat(r.account);
     await bot.sendMessage(TG_CHAT_ID, renderIncrease(rec, stats));
     state.seen[r.id] = true;
-    if (rec.timestamp > newest) newest = rec.timestamp;
+    newest = Math.max(newest, rec.timestamp);
   }
 
   for (const r of await fetchDecrease(since)) {
@@ -236,7 +281,7 @@ async function runOnce() {
       const stats = await fetchUserStat(r.account);
       await bot.sendMessage(TG_CHAT_ID, renderDecrease(rec, stats));
       state.seen[r.id] = true;
-      if (rec.timestamp > newest) newest = rec.timestamp;
+      newest = Math.max(newest, rec.timestamp);
     }
   }
 
@@ -246,10 +291,11 @@ async function runOnce() {
     const stats = await fetchUserStat(r.account);
     await bot.sendMessage(TG_CHAT_ID, renderLiquidation(rec, stats));
     state.seen[r.id] = true;
-    if (rec.timestamp > newest) newest = rec.timestamp;
+    newest = Math.max(newest, rec.timestamp);
   }
 
-  state.lastTs = newest;
+  // ✅ bump timestamp so same events aren’t re-fetched
+  state.lastTs = Math.max(newest, since) + 1;
   saveState();
 }
 
