@@ -1,5 +1,3 @@
-// MoneyX Trades TG Bot — Railway-ready (schema-aligned + proper collateral USD)
-
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
