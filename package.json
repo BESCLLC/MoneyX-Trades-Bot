@@ -1,0 +1,17 @@
+{
+  "name": "moneyx-trades-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "node-telegram-bot-api": "^0.64.0"
+  }
+}
