@@ -1,5 +1,3 @@
-// MoneyX Trades TG Bot — Full with CoinMarketCap Pricing
-
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -11,7 +9,6 @@ const {
   TG_CHAT_ID,
   SUBGRAPH_URL,
   POLL_INTERVAL_MS = '15000',
-  MIN_SIZE_USD = '0',
   EXPLORER_TX_BASE = 'https://bscscan.com/tx/',
   CMC_API_KEY,
 } = process.env;
@@ -43,34 +40,31 @@ const calcLev = (size, coll) => (!size || !coll) ? '—' : (size / coll).toFixed
 const scale1e30 = (v) => Number(v) / 1e30;
 const scale1e18 = (v) => Number(v) / 1e18;
 
-// Map collateral token addresses → CMC symbols
-const TOKEN_SYMBOLS = {
-  "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "BNB",   // WBNB
-  "0x2170ed0880ac9a755fd29b2688956bd959f933f8": "ETH",   // ETH
-  "0xba2ae424d960c26247dd6c32edc70b295c744c43": "DOGE",  // DOGE
-  "0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe": "XRP",   // XRP
+// Token symbols
+const SYMBOLS = {
+  "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "BNB",
+  "0x2170ed0880ac9a755fd29b2688956bd959f933f8": "ETH",
+  "0xba2ae424d960c26247dd6c32edc70b295c744c43": "DOGE",
+  "0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe": "XRP",
+  "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c": "BTC",
+  "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",
 };
+const sym = (addr) => SYMBOLS[addr?.toLowerCase()] || short(addr);
 
-// Cache prices for 1 minute
+// CMC price cache
 const PRICE_CACHE = {};
-async function getTokenPriceUsd(tokenAddr) {
-  const sym = TOKEN_SYMBOLS[tokenAddr.toLowerCase()];
-  if (!sym) return null;
-
-  if (PRICE_CACHE[sym] && Date.now() - PRICE_CACHE[sym].ts < 60_000) {
-    return PRICE_CACHE[sym].usd;
+async function getPrice(symbol) {
+  if (PRICE_CACHE[symbol] && Date.now() - PRICE_CACHE[symbol].ts < 60000) {
+    return PRICE_CACHE[symbol].usd;
   }
-
   try {
     const res = await axios.get(
       "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
-      {
-        params: { symbol: sym, convert: "USD" },
-        headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY }
-      }
+      { params: { symbol, convert: "USD" },
+        headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY } }
     );
-    const usd = res.data.data[sym].quote.USD.price;
-    PRICE_CACHE[sym] = { usd, ts: Date.now() };
+    const usd = res.data.data[symbol].quote.USD.price;
+    PRICE_CACHE[symbol] = { usd, ts: Date.now() };
     return usd;
   } catch (e) {
     console.error("CMC price fetch failed:", e.message);
@@ -78,62 +72,87 @@ async function getTokenPriceUsd(tokenAddr) {
   }
 }
 
+async function getTokenPriceUsd(addr) {
+  const s = SYMBOLS[addr?.toLowerCase()];
+  if (!s) return null;
+  return getPrice(s);
+}
+
 // ---------- Renderer ----------
-function renderMessage(type, rec) {
-  const isLiq = type === 'Liquidation';
-  const direction = rec.isLong ? '🟢 LONG' : '🔴 SHORT';
-  const title = isLiq ? '💥 LIQUIDATION' : `📈 ${type} ${direction}`;
+function renderIncrease(rec) {
+  const whale = rec.size > 10000 ? ' 🐳' : '';
+  return (
+`${whale} 📈 Increase ${rec.isLong ? '🟢 LONG' : '🔴 SHORT'}
+• Pair: ${sym(rec.indexToken)}-USD
+• Wallet: ${short(rec.account)}
+• Size: ${fmtUsd(rec.size)}
+• Collateral: ${fmtUsd(rec.collateral)} (${sym(rec.collateralToken)})
+• Leverage: ${rec.leverage}
+• Price: ${fmtPrice(rec.price)}${rec.tx ? `\n🔗 tx: ${EXPLORER_TX_BASE}${rec.tx}` : ''}`
+  );
+}
 
-  let lines = [
-    `${title}`,
-    `• Pair: ${rec.indexToken}`,
-    `• Wallet: ${short(rec.account)}`,
-    `• Size: ${fmtUsd(rec.size)}`,
-  ];
-  if (rec.collateral != null) lines.push(`• Collateral: ${fmtUsd(rec.collateral)}`);
-  lines.push(`• Leverage: ${rec.leverage}`);
-  lines.push(`• Price: ${fmtPrice(rec.price)}`);
-
-  if (isLiq) {
-    if (rec.avgPrice) lines.push(`• Avg Entry: ${fmtPrice(rec.avgPrice)}`);
-    if (rec.loss) lines.push(`• Loss: ${fmtUsd(rec.loss)}`);
+function renderDecrease(rec) {
+  if (rec.pnlUsd > 0) {
+    return (
+`💰 Close 🟢 PROFIT
+• ${fmtUsd(rec.pnlUsd)} (+${rec.pnlPct.toFixed(1)}%)
+• Pair: ${sym(rec.indexToken)}-USD
+• Wallet: ${short(rec.account)}`
+    );
+  } else {
+    return (
+`🔻 Close 🔴 LOSS
+• ${fmtUsd(rec.pnlUsd)} (${rec.pnlPct.toFixed(1)}%)
+• Pair: ${sym(rec.indexToken)}-USD
+• Wallet: ${short(rec.account)}`
+    );
   }
-  return lines.join('\n') + (rec.tx ? `\n🔗 tx: ${EXPLORER_TX_BASE}${rec.tx}` : '');
+}
+
+function renderLiquidation(rec) {
+  return (
+`💥 LIQUIDATION ALERT 💥
+• Wallet REKT: ${short(rec.account)}
+• Pair: ${sym(rec.indexToken)}-USD
+• Loss: ${fmtUsd(rec.loss)}
+• Size: ${fmtUsd(rec.size)} at ${rec.leverage}
+🚑 Better luck next time...`
+  );
 }
 
 // ---------- Queries ----------
 async function fetchIncrease(since) {
   const q = `
-    {
-      createIncreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
+    { createIncreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
         id account indexToken collateralToken isLong sizeDelta amountIn acceptablePrice transaction timestamp
-      }
-    }
-  `;
+    } }`;
   const res = await axios.post(SUBGRAPH_URL, { query: q });
   return res.data.data.createIncreasePositions || [];
 }
 async function fetchDecrease(since) {
   const q = `
-    {
-      createDecreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
+    { createDecreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
         id account indexToken collateralToken isLong sizeDelta acceptablePrice transaction timestamp
-      }
-    }
-  `;
+    } }`;
   const res = await axios.post(SUBGRAPH_URL, { query: q });
   return res.data.data.createDecreasePositions || [];
 }
 async function fetchLiquidations(since) {
   const q = `
-    {
-      liquidatedPositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
+    { liquidatedPositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
         id account indexToken collateralToken isLong size collateral markPrice averagePrice loss timestamp
-      }
-    }
-  `;
+    } }`;
   const res = await axios.post(SUBGRAPH_URL, { query: q });
   return res.data.data.liquidatedPositions || [];
+}
+async function fetchActivePosition(account, indexToken, isLong) {
+  const q = `
+    { activePositions(where: { account: "${account}", indexToken: "${indexToken}", isLong: ${isLong} }) {
+        averagePrice size collateral
+    } }`;
+  const res = await axios.post(SUBGRAPH_URL, { query: q });
+  return res.data.data.activePositions?.[0] || null;
 }
 
 // ---------- Handlers ----------
@@ -143,28 +162,39 @@ async function handleIncrease(r) {
   const price = await getTokenPriceUsd(r.collateralToken);
   const collUsd = price ? collAmount * price : 0;
   return {
-    id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong,
+    id: r.id, account: r.account, indexToken: r.indexToken, collateralToken: r.collateralToken, isLong: r.isLong,
     size, collateral: collUsd, leverage: calcLev(size, collUsd),
-    price: scale1e30(r.acceptablePrice),
-    tx: r.transaction, timestamp: Number(r.timestamp),
+    price: scale1e30(r.acceptablePrice), tx: r.transaction, timestamp: Number(r.timestamp),
   };
 }
+
 async function handleDecrease(r) {
   const size = scale1e30(r.sizeDelta);
+  const active = await fetchActivePosition(r.account, r.indexToken, r.isLong);
+  if (!active) return null;
+
+  const entry = scale1e30(active.averagePrice);
+  const current = await getTokenPriceUsd(r.indexToken);
+  if (!entry || !current) return null;
+
+  const delta = r.isLong ? (current - entry) : (entry - current);
+  const pnlUsd = (delta / entry) * size;
+  const collUsd = scale1e30(active.collateral);
+  const pnlPct = collUsd ? (pnlUsd / collUsd) * 100 : 0;
+
   return {
     id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong,
-    size, collateral: null, leverage: '—',
-    price: scale1e30(r.acceptablePrice),
-    tx: r.transaction, timestamp: Number(r.timestamp),
+    pnlUsd, pnlPct, size, timestamp: Number(r.timestamp),
   };
 }
+
 async function handleLiquidation(r) {
   const size = scale1e30(r.size);
   const collAmount = scale1e18(r.collateral);
   const price = await getTokenPriceUsd(r.collateralToken);
   const collUsd = price ? collAmount * price : 0;
   return {
-    id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong,
+    id: r.id, account: r.account, indexToken: r.indexToken, collateralToken: r.collateralToken, isLong: r.isLong,
     size, collateral: collUsd, leverage: calcLev(size, collUsd),
     price: scale1e30(r.markPrice), avgPrice: scale1e30(r.averagePrice),
     loss: scale1e30(r.loss), tx: null, timestamp: Number(r.timestamp),
@@ -179,21 +209,25 @@ async function runOnce() {
   for (const r of await fetchIncrease(since)) {
     if (state.seen[r.id]) continue;
     const rec = await handleIncrease(r);
-    await bot.sendMessage(TG_CHAT_ID, renderMessage('Increase', rec));
+    await bot.sendMessage(TG_CHAT_ID, renderIncrease(rec));
     state.seen[r.id] = true;
     if (rec.timestamp > newest) newest = rec.timestamp;
   }
+
   for (const r of await fetchDecrease(since)) {
     if (state.seen[r.id]) continue;
     const rec = await handleDecrease(r);
-    await bot.sendMessage(TG_CHAT_ID, renderMessage('Decrease', rec));
-    state.seen[r.id] = true;
-    if (rec.timestamp > newest) newest = rec.timestamp;
+    if (rec) {
+      await bot.sendMessage(TG_CHAT_ID, renderDecrease(rec));
+      state.seen[r.id] = true;
+      if (rec.timestamp > newest) newest = rec.timestamp;
+    }
   }
+
   for (const r of await fetchLiquidations(since)) {
     if (state.seen[r.id]) continue;
     const rec = await handleLiquidation(r);
-    await bot.sendMessage(TG_CHAT_ID, renderMessage('Liquidation', rec));
+    await bot.sendMessage(TG_CHAT_ID, renderLiquidation(rec));
     state.seen[r.id] = true;
     if (rec.timestamp > newest) newest = rec.timestamp;
   }
@@ -204,17 +238,17 @@ async function runOnce() {
 
 // ---------- Startup ----------
 (async function main() {
-  console.log('🚀 MoneyX TG bot started. Polling:', SUBGRAPH_URL);
+  console.log('🚀 MoneyX TG bot hype edition started. Polling:', SUBGRAPH_URL);
 
-  // dump last 5 increases as sanity check
   const recent = await fetchIncrease(state.lastTs - 3600);
   for (const r of recent.slice(-5)) {
     const rec = await handleIncrease(r);
     await bot.sendMessage(TG_CHAT_ID,
-`🧪 STARTUP 
+`🧪 STARTUP TEST
 • Wallet: ${short(rec.account)}
+• Pair: ${sym(rec.indexToken)}-USD
 • Size: ${fmtUsd(rec.size)}
-• Collateral: ${fmtUsd(rec.collateral)}
+• Collateral: ${fmtUsd(rec.collateral)} (${sym(rec.collateralToken)})
 • Leverage: ${rec.leverage}
 • Price: ${fmtPrice(rec.price)}`);
   }
