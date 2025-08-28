@@ -1,67 +1,65 @@
+// MoneyX Trades TG Bot — Direct On-Chain Events 🚀
+// Uses Alchemy BNB WS endpoint, no The Graph.
 
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
-const TelegramBot = require('node-telegram-bot-api');
+const { ethers } = require("ethers");
+const TelegramBot = require("node-telegram-bot-api");
+const axios = require("axios");
 
 const {
   TG_BOT_TOKEN,
   TG_CHAT_ID,
-  SUBGRAPH_URL,
-  POLL_INTERVAL_MS = '60000', // default 1 min
-  EXPLORER_TX_BASE = 'https://bscscan.com/tx/',
+  RPC_WS_URL = "wss://bnb-mainnet.g.alchemy.com/v2/4Vvah0kUdr9X91EP08ZRZ",
+  EXPLORER_TX_BASE = "https://bscscan.com/tx/",
   CMC_API_KEY,
 } = process.env;
 
-if (!TG_BOT_TOKEN || !TG_CHAT_ID || !SUBGRAPH_URL || !CMC_API_KEY) {
-  console.error('❌ Missing env vars: TG_BOT_TOKEN, TG_CHAT_ID, SUBGRAPH_URL, CMC_API_KEY');
+if (!TG_BOT_TOKEN || !TG_CHAT_ID || !RPC_WS_URL || !CMC_API_KEY) {
+  console.error("❌ Missing env vars: TG_BOT_TOKEN, TG_CHAT_ID, RPC_WS_URL, CMC_API_KEY");
   process.exit(1);
 }
 
 const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
+const provider = new ethers.WebSocketProvider(RPC_WS_URL);
 
-// ---------- State ----------
-const STATE_FILE = path.join(__dirname, 'state.json');
-let state = loadStateSync();
-function loadStateSync() {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
-  catch { return { lastTs: 0, seen: {} }; }
-}
-function saveState() {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-}
+// === Contracts ===
+const PositionRouter = new ethers.Contract(
+  "0x065F9746b33F303c6481549BAc42A3885903fA44", // PositionRouter
+  [
+    "event CreateIncreasePosition(address account,address collateralToken,address indexToken,uint256 amountIn,uint256 minOut,uint256 sizeDelta,bool isLong,uint256 acceptablePrice,uint256 executionFee,uint256 indexTokenPrice,uint256 blockNumber,uint256 blockTime,bytes32 key,uint256 orderIndex)",
+    "event CreateDecreasePosition(address account,address collateralToken,address indexToken,uint256 collateralDelta,uint256 sizeDelta,bool isLong,uint256 acceptablePrice,uint256 executionFee,uint256 indexTokenPrice,uint256 blockNumber,uint256 blockTime,bytes32 key,uint256 orderIndex)"
+  ],
+  provider
+);
 
-// ---------- Helpers ----------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const short = (addr) => (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : '');
-const fmtUsd = (v) => (v == null ? '—' : `$${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
-const fmtPrice = (v) => (v == null ? '—' : v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
-const calcLev = (size, coll) => (!size || !coll ? '—' : (size / coll).toFixed(1) + 'x');
+const Vault = new ethers.Contract(
+  "0xeB0E5E1a8500317A1B8fDd195097D5509Ef861de", // Vault
+  [
+    "event LiquidatePosition(address account,address collateralToken,address indexToken,bool isLong,uint256 size,uint256 collateral,uint256 reserveAmount,uint256 realisedPnl,uint256 markPrice)"
+  ],
+  provider
+);
 
-const scale1e30 = (v) => Number(v) / 1e30;
-const scale1e18 = (v) => Number(v) / 1e18;
-
-// Supported tokens
+// === Token symbols ===
 const SYMBOLS = {
-  '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': 'BNB',
-  '0x2170ed0880ac9a755fd29b2688956bd959f933f8': 'ETH',
-  '0xba2ae424d960c26247dd6c32edc70b295c744c43': 'DOGE',
-  '0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe': 'XRP',
-  '0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c': 'BTC',
-  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'USDC',
+  "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "BNB",
+  "0x2170ed0880ac9a755fd29b2688956bd959f933f8": "ETH",
+  "0xba2ae424d960c26247dd6c32edc70b295c744c43": "DOGE",
+  "0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe": "XRP",
+  "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c": "BTC",
+  "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",
 };
-const sym = (addr) => SYMBOLS[addr?.toLowerCase()] || short(addr);
+const sym = (addr) => SYMBOLS[addr?.toLowerCase()] || addr?.slice(0, 6) + "…" + addr?.slice(-4);
 
-// ---------- Price Fetch (CMC) ----------
+// === Price cache from CMC ===
 const PRICE_CACHE = {};
 async function getPrice(symbol) {
   if (PRICE_CACHE[symbol] && Date.now() - PRICE_CACHE[symbol].ts < 60000) {
     return PRICE_CACHE[symbol].usd;
   }
-  const res = await axios.get('https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest', {
-    params: { symbol, convert: 'USD' },
-    headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
+  const res = await axios.get("https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest", {
+    params: { symbol, convert: "USD" },
+    headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
   });
   const usd = res.data.data[symbol].quote.USD.price;
   PRICE_CACHE[symbol] = { usd, ts: Date.now() };
@@ -73,172 +71,71 @@ async function getTokenPriceUsd(addr) {
   return getPrice(s);
 }
 
-// ---------- Trader Stats ----------
-async function fetchUserStat(account) {
-  const q = `{ userStat(id: "${account.toLowerCase()}") {
-    actionCount
-    actionMarginCount
-    actionSwapCount
-  } }`;
-  try {
-    const res = await axios.post(SUBGRAPH_URL, { query: q });
-    return res.data?.data?.userStat || null;
-  } catch {
-    return null;
-  }
-}
-function renderUserStats(stats) {
-  if (!stats) return '';
-  return `\n📊 Trader Stats
-• Total Actions: ${stats.actionCount}
-• Margin Trades: ${stats.actionMarginCount}
-• Swaps: ${stats.actionSwapCount}`;
-}
+// === Format helpers ===
+const short = (addr) => (addr ? addr.slice(0, 6) + "…" + addr.slice(-4) : "");
+const fmtUsd = (v) => `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+const fmtPrice = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+const calcLev = (size, coll) => (!size || !coll ? "—" : (size / coll).toFixed(1) + "x");
 
-// ---------- Renderers ----------
-function renderIncrease(rec, stats) {
-  const whale = rec.size > 10000 ? ' 🐳' : '';
-  return `${whale} 📈 Increase ${rec.isLong ? '🟢 LONG' : '🔴 SHORT'}
-• Pair: ${sym(rec.indexToken)}-USD
-• Wallet: ${short(rec.account)}
-• Size: ${fmtUsd(rec.size)}
-• Collateral: ${fmtUsd(rec.collateral)} (${sym(rec.collateralToken)})
-• Leverage: ${rec.leverage}
-• Price: ${fmtPrice(rec.price)}${
-    rec.tx ? `\n🔗 tx: ${EXPLORER_TX_BASE}${rec.tx}` : ''
-  }${renderUserStats(stats)}`;
-}
-function renderDecrease(rec, stats) {
-  return rec.pnlUsd > 0
-    ? `💰 Close 🟢 PROFIT
-• ${fmtUsd(rec.pnlUsd)} (+${rec.pnlPct.toFixed(1)}%)
-• Pair: ${sym(rec.indexToken)}-USD
-• Wallet: ${short(rec.account)}${renderUserStats(stats)}`
-    : `🔻 Close 🔴 LOSS
-• ${fmtUsd(rec.pnlUsd)} (${rec.pnlPct.toFixed(1)}%)
-• Pair: ${sym(rec.indexToken)}-USD
-• Wallet: ${short(rec.account)}${renderUserStats(stats)}`;
-}
-function renderLiquidation(rec, stats) {
-  return `💥 LIQUIDATION ALERT 💥
-• Wallet REKT: ${short(rec.account)}
-• Pair: ${sym(rec.indexToken)}-USD
-• Loss: ${fmtUsd(rec.loss)}
-• Size: ${fmtUsd(rec.size)} at ${rec.leverage}
-🚑 Better luck next time...${renderUserStats(stats)}`;
-}
+// === Event Handlers ===
+PositionRouter.on("CreateIncreasePosition", async (
+  account, collateralToken, indexToken, amountIn, , sizeDelta, isLong,
+  acceptablePrice, , , , blockTime, key
+) => {
+  const size = Number(sizeDelta) / 1e30;
+  const coll = Number(amountIn) / 1e18;
+  const price = await getTokenPriceUsd(indexToken);
+  const collUsd = price ? coll * price : coll;
 
-// ---------- Query (batched with retry) ----------
-async function fetchEvents(since) {
-  const q = `{
-    createIncreasePositions(first: 100, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
-      id account indexToken collateralToken isLong sizeDelta amountIn acceptablePrice transaction timestamp
-    }
-    createDecreasePositions(first: 100, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
-      id account indexToken collateralToken isLong sizeDelta acceptablePrice transaction timestamp
-    }
-    liquidatedPositions(first: 100, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
-      id account indexToken collateralToken isLong size collateral markPrice averagePrice loss timestamp
-    }
-  }`;
+  const msg = `📈 Increase ${isLong ? "🟢 LONG" : "🔴 SHORT"}
+• Pair: ${sym(indexToken)}-USD
+• Wallet: ${short(account)}
+• Size: ${fmtUsd(size)}
+• Collateral: ${fmtUsd(collUsd)} (${sym(collateralToken)})
+• Leverage: ${calcLev(size, collUsd)}
+• Price: ${fmtPrice(Number(acceptablePrice) / 1e30)}
+• Time: ${new Date(Number(blockTime) * 1000).toLocaleTimeString()}`;
 
-  let retries = 0;
-  while (true) {
-    try {
-      const res = await axios.post(SUBGRAPH_URL, { query: q });
-      if (res.data.errors) throw new Error(JSON.stringify(res.data.errors));
-      return res.data.data;
-    } catch (e) {
-      retries++;
-      if (e.response && e.response.status === 429) {
-        const retry = e.response.headers['retry-after']
-          ? parseInt(e.response.headers['retry-after'], 10) * 1000
-          : 60000; // default 60s
-        console.warn(`⏳ Rate limited. Waiting ${retry / 1000}s before retry...`);
-        await sleep(retry);
-        continue;
-      }
-      console.error('fetchEvents error:', e.message);
-      return { createIncreasePositions: [], createDecreasePositions: [], liquidatedPositions: [] };
-    }
-  }
-}
+  bot.sendMessage(TG_CHAT_ID, msg);
+});
 
-// ---------- Handlers ----------
-async function handleIncrease(r) {
-  const size = scale1e30(r.sizeDelta);
-  const collAmount = scale1e18(r.amountIn);
-  const price = await getTokenPriceUsd(r.collateralToken);
-  const collUsd = price ? collAmount * price : 0;
-  return {
-    id: r.id, account: r.account, indexToken: r.indexToken, collateralToken: r.collateralToken, isLong: r.isLong,
-    size, collateral: collUsd, leverage: calcLev(size, collUsd),
-    price: scale1e30(r.acceptablePrice), tx: r.transaction, timestamp: Number(r.timestamp),
-  };
-}
-async function handleDecrease(r) {
-  const size = scale1e30(r.sizeDelta);
-  const current = await getTokenPriceUsd(r.indexToken);
-  if (!current) return null;
-  const entry = scale1e30(r.acceptablePrice);
-  const delta = r.isLong ? current - entry : entry - current;
-  const pnlUsd = (delta / entry) * size;
-  const pnlPct = (pnlUsd / size) * 100;
-  return { id: r.id, account: r.account, indexToken: r.indexToken, isLong: r.isLong,
-    pnlUsd, pnlPct, size, timestamp: Number(r.timestamp) };
-}
-async function handleLiquidation(r) {
-  const size = scale1e30(r.size);
-  const collAmount = scale1e18(r.collateral);
-  const price = await getTokenPriceUsd(r.collateralToken);
-  const collUsd = price ? collAmount * price : 0;
-  return { id: r.id, account: r.account, indexToken: r.indexToken, collateralToken: r.collateralToken, isLong: r.isLong,
-    size, collateral: collUsd, leverage: calcLev(size, collUsd),
-    price: scale1e30(r.markPrice), avgPrice: scale1e30(r.averagePrice),
-    loss: scale1e30(r.loss), timestamp: Number(r.timestamp) };
-}
+PositionRouter.on("CreateDecreasePosition", async (
+  account, collateralToken, indexToken, collateralDelta, sizeDelta, isLong,
+  acceptablePrice, , , , blockTime, key
+) => {
+  const size = Number(sizeDelta) / 1e30;
+  const coll = Number(collateralDelta) / 1e18;
+  const price = await getTokenPriceUsd(indexToken);
+  const collUsd = price ? coll * price : coll;
 
-// ---------- Main Loop ----------
-async function runOnce() {
-  const since = state.lastTs || 0;
-  let newest = since;
-  const data = await fetchEvents(since);
+  const msg = `📉 Decrease ${isLong ? "🟢 LONG" : "🔴 SHORT"}
+• Pair: ${sym(indexToken)}-USD
+• Wallet: ${short(account)}
+• Size: ${fmtUsd(size)}
+• Collateral Out: ${fmtUsd(collUsd)} (${sym(collateralToken)})
+• Price: ${fmtPrice(Number(acceptablePrice) / 1e30)}
+• Time: ${new Date(Number(blockTime) * 1000).toLocaleTimeString()}`;
 
-  for (const r of data.createIncreasePositions) {
-    if (state.seen[r.id]) continue;
-    const rec = await handleIncrease(r);
-    const stats = await fetchUserStat(r.account);
-    await bot.sendMessage(TG_CHAT_ID, renderIncrease(rec, stats));
-    state.seen[r.id] = true;
-    newest = Math.max(newest, rec.timestamp);
-  }
+  bot.sendMessage(TG_CHAT_ID, msg);
+});
 
-  for (const r of data.createDecreasePositions) {
-    if (state.seen[r.id]) continue;
-    const rec = await handleDecrease(r);
-    if (rec) {
-      const stats = await fetchUserStat(r.account);
-      await bot.sendMessage(TG_CHAT_ID, renderDecrease(rec, stats));
-      state.seen[r.id] = true;
-      newest = Math.max(newest, rec.timestamp);
-    }
-  }
+Vault.on("LiquidatePosition", async (
+  account, collateralToken, indexToken, isLong,
+  size, collateral, , realisedPnl, markPrice
+) => {
+  const sizeUsd = Number(size) / 1e30;
+  const coll = Number(collateral) / 1e18;
+  const loss = Number(realisedPnl) / 1e30;
 
-  for (const r of data.liquidatedPositions) {
-    if (state.seen[r.id]) continue;
-    const rec = await handleLiquidation(r);
-    const stats = await fetchUserStat(r.account);
-    await bot.sendMessage(TG_CHAT_ID, renderLiquidation(rec, stats));
-    state.seen[r.id] = true;
-    newest = Math.max(newest, rec.timestamp);
-  }
+  const msg = `💥 LIQUIDATION
+• Wallet REKT: ${short(account)}
+• Pair: ${sym(indexToken)}-USD
+• Size: ${fmtUsd(sizeUsd)} 
+• Collateral: ${fmtUsd(coll)} (${sym(collateralToken)})
+• Loss: ${fmtUsd(loss)}
+• Price: ${fmtPrice(Number(markPrice) / 1e30)}`;
 
-  state.lastTs = Math.max(newest, since) + 1;
-  saveState();
-}
+  bot.sendMessage(TG_CHAT_ID, msg);
+});
 
-// ---------- Startup ----------
-(async function main() {
-  console.log('🚀 MoneyX TG bot stable started. Polling:', SUBGRAPH_URL);
-  setInterval(runOnce, Number(POLL_INTERVAL_MS));
-})();
+console.log("🚀 MoneyX TG bot live on-chain with Alchemy — no more rate limits!");
