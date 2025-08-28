@@ -6,8 +6,8 @@ const { WebSocketProvider, Contract } = require('ethers');
 
 // ======== ENV ========
 const ALCHEMY_WSS   = 'wss://bnb-mainnet.g.alchemy.com/v2/4Vvah0kUdr9X91EP08ZRZ';
-const TG_BOT_TOKEN  = process.env.TG_BOT_TOKEN;     // <-- keep this name
-const TG_CHAT_ID    = process.env.TG_CHAT_ID;       // e.g. -1002863526209
+const TG_BOT_TOKEN  = process.env.TG_BOT_TOKEN;   // e.g. 7814:AAAA...
+const TG_CHAT_ID    = process.env.TG_CHAT_ID;     // e.g. -1002863526209
 
 if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
   console.error('Missing TG_BOT_TOKEN or TG_CHAT_ID in .env');
@@ -27,8 +27,8 @@ const TOKENS = {
   '0x4925c7e05347d90a3c7e07f8d8b3a52faac91bcb': 'USDG',
 
   // majors
-  '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': 'BNB',
-  '0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c': 'BTC',
+  '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': 'BNB',   // WBNB
+  '0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c': 'BTC',   // BTCB
   '0x2170ed0880ac9a755fd29b2688956bd959f933f8': 'ETH',
   '0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe': 'XRP',
   '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'USDC',
@@ -60,11 +60,10 @@ const short = (a) => a ? a.slice(0,6)+'…'+a.slice(-4) : '—';
 
 // convert BigInt(1e30) USD to display string
 function usd30ToStr(xBig) {
-  const n = Number(xBig); // ok for display; precision loss acceptable visually
+  const n = Number(xBig); // for display; slight precision loss is fine
   return `$${(n / 1e30).toLocaleString(undefined,{maximumFractionDigits:2})}`;
 }
 
-// plain number from 1e30 fixed
 function from1e30(xBig) {
   return Number(xBig) / 1e30;
 }
@@ -86,10 +85,10 @@ async function send(text) {
 
 async function pullPosition(account, collateralToken, indexToken, isLong) {
   try {
-    const res = await vault.getPosition(account, collateralToken, indexToken, isLong);
+    const res   = await vault.getPosition(account, collateralToken, indexToken, isLong);
     const delta = await vault.getPositionDelta(account, collateralToken, indexToken, isLong);
     const [size, collateral, avgPrice] = [res[0], res[1], res[2]];
-    const [hasProfit, pnl] = [delta[0], delta[1]];
+    const [hasProfit, pnl]             = [delta[0], delta[1]];
 
     if (size === 0n) return null;
 
@@ -112,7 +111,7 @@ async function pullPosition(account, collateralToken, indexToken, isLong) {
 // OPEN / INCREASE
 router.on('ExecuteIncreasePosition', async (account, path, indexToken, amountIn, minOut, sizeDelta, isLong, acceptablePrice, executionFee, blockGap, timeGap, ev) => {
   try {
-    const collateralToken = path[path.length - 1]; // matches PositionRouter internal logic
+    const collateralToken = path[path.length - 1];
     const p = await pullPosition(account, collateralToken, indexToken, isLong);
     const side = isLong ? '🟢 LONG' : '🔴 SHORT';
     const pair = sym(indexToken);
@@ -152,8 +151,7 @@ router.on('ExecuteDecreasePosition', async (account, path, indexToken, collatera
     const side = isLong ? '🟢 LONG' : '🔴 SHORT';
     const pair = sym(indexToken);
 
-    // If fully closed, getPosition may still show size>0 until the same block settles; we still print what we have.
-    const sizeStr = usd30ToStr(sizeDelta);
+    const sizeStr     = usd30ToStr(sizeDelta);
     const collBackStr = usd30ToStr(collateralDelta);
 
     if (!p) {
@@ -203,10 +201,5 @@ vault.on('LiquidatePosition', async (key, account, collateralToken, indexToken, 
   }
 });
 
-// ======== Provider lifecycle logs ========
-provider.on('error', (e) => console.error('WS error:', e?.message || e));
-provider.on('close', () => console.error('WS closed — provider will not reconnect automatically on ethers v6'));
 console.log('🚀 MoneyX TG bot live — listening (Router + Vault)');
-
-// Send a boot ping so you know TG works:
 send('✅ MoneyX bot online — listening for trades…').catch(()=>{});
