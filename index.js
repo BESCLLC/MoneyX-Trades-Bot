@@ -1,126 +1,212 @@
+// MoneyX Trades Bot — on-chain, exact PnL/lev, no subgraph, no placeholders
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const { WebSocketProvider, Contract } = require("ethers");
+const { WebSocketProvider, Contract } = require('ethers');
 
-// 🔗 Alchemy BNB Chain WebSocket
-const provider = new WebSocketProvider("wss://bnb-mainnet.g.alchemy.com/v2/4Vvah0kUdr9X91EP08ZRZ");
+// ======== ENV ========
+const ALCHEMY_WSS   = 'wss://bnb-mainnet.g.alchemy.com/v2/4Vvah0kUdr9X91EP08ZRZ';
+const TG_BOT_TOKEN  = process.env.TG_BOT_TOKEN;     // <-- keep this name
+const TG_CHAT_ID    = process.env.TG_CHAT_ID;       // e.g. -1002863526209
 
-// 📲 Telegram
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false });
-const chatId = process.env.TELEGRAM_CHAT_ID;
+if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
+  console.error('Missing TG_BOT_TOKEN or TG_CHAT_ID in .env');
+  process.exit(1);
+}
 
-// 📝 Contracts
-const addresses = {
-  Vault: "0xeB0E5E1a8500317A1B8fDd195097D5509Ef861de",
-  PositionRouter: "0x065F9746b33F303c6481549BAc42A3885903fA44",
+// ======== ADDRESSES (your deployed) ========
+const ADDR = {
+  Vault:          '0xeB0E5E1a8500317A1B8fDd195097D5509Ef861de',
+  PositionRouter: '0x065F9746b33F303c6481549BAc42A3885903fA44',
 };
 
-// 📝 Tokens
+// ======== TOKEN MAP (BNB chain) ========
 const TOKENS = {
-  MONEY: { addr: "0x4fFe5ec4D8B9822e01c9E49678884bAEc17F60D9", symbol: "MONEY", decimals: 18 },
-  USDG:  { addr: "0x4925C7e05347d90A3c7e07f8D8b3A52FaAC91bCb", symbol: "USDG", decimals: 18 },
-  BTC:   { addr: "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c", symbol: "BTC", decimals: 18 },
-  ETH:   { addr: "0x2170Ed0880ac9A755fd29B2688956BD959F933F8", symbol: "ETH", decimals: 18 },
-  BNB:   { addr: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", symbol: "BNB", decimals: 18 },
-  DOGE:  { addr: "0xba2ae424d960c26247dd6c32edc70b295c744c43", symbol: "DOGE", decimals: 8 },
-  XRP:   { addr: "0x1D2F0da169ceB9fC7B3144628dB156f3F6c60dBE", symbol: "XRP", decimals: 18 },
-  USDC:  { addr: "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", symbol: "USDC", decimals: 18 },
+  // platform
+  '0x4ffe5ec4d8b9822e01c9e49678884baec17f60d9': 'MONEY',
+  '0x4925c7e05347d90a3c7e07f8d8b3a52faac91bcb': 'USDG',
+
+  // majors
+  '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': 'BNB',
+  '0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c': 'BTC',
+  '0x2170ed0880ac9a755fd29b2688956bd959f933f8': 'ETH',
+  '0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe': 'XRP',
+  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'USDC',
+  '0xba2ae424d960c26247dd6c32edc70b295c744c43': 'DOGE',
 };
+const sym = (addr) => TOKENS[(addr||'').toLowerCase()] || (addr ? addr.slice(0,6)+'…'+addr.slice(-4) : '—');
 
-// ⚙️ Minimal ABI for Vault
-const abiVault = [
-  "function getPosition(address account, address collateralToken, address indexToken, bool isLong) view returns (uint256,uint256,uint256,uint256,uint256,uint256,bool,uint256)",
-  "function getPositionDelta(address account, address collateralToken, address indexToken, bool isLong) view returns (bool,uint256)",
-  "event LiquidatePosition(bytes32 key, address account, address collateralToken, address indexToken, bool isLong, uint256 size, uint256 collateral, uint256 reserveAmount, int256 realisedPnl, uint256 markPrice)"
+// ======== Minimal ABIs (events + views we actually use) ========
+const ABI_VAULT = [
+  "function getPosition(address account,address collateralToken,address indexToken,bool isLong) view returns (uint256 size,uint256 collateral,uint256 averagePrice,uint256 entryFundingRate,uint256 reserveAmount,uint256 realisedPnl,bool realisedPnlIsPositive,uint256 lastIncreasedTime)",
+  "function getPositionDelta(address account,address collateralToken,address indexToken,bool isLong) view returns (bool hasProfit,uint256 delta)",
+  "event LiquidatePosition(bytes32 key,address account,address collateralToken,address indexToken,bool isLong,uint256 size,uint256 collateral,uint256 reserveAmount,int256 realisedPnl,uint256 markPrice)"
 ];
 
-// ⚙️ Minimal ABI for PositionRouter
-const abiRouter = [
-  "event ExecuteIncreasePosition(address account, address[] path, address indexToken, uint256 amountIn, uint256 minOut, uint256 sizeDelta, bool isLong, uint256 acceptablePrice, uint256 executionFee, uint256 blockGap, uint256 timeGap)",
-  "event ExecuteDecreasePosition(address account, address[] path, address indexToken, uint256 collateralDelta, uint256 sizeDelta, bool isLong, address receiver, uint256 acceptablePrice, uint256 minOut, uint256 executionFee, uint256 blockGap, uint256 timeGap)"
+const ABI_ROUTER = [
+  "event ExecuteIncreasePosition(address indexed account,address[] path,address indexToken,uint256 amountIn,uint256 minOut,uint256 sizeDelta,bool isLong,uint256 acceptablePrice,uint256 executionFee,uint256 blockGap,uint256 timeGap)",
+  "event ExecuteDecreasePosition(address indexed account,address[] path,address indexToken,uint256 collateralDelta,uint256 sizeDelta,bool isLong,address receiver,uint256 acceptablePrice,uint256 minOut,uint256 executionFee,uint256 blockGap,uint256 timeGap)"
 ];
 
-// ⚙️ Contracts
-const vault = new Contract(addresses.Vault, abiVault, provider);
-const router = new Contract(addresses.PositionRouter, abiRouter, provider);
+// ======== Setup ========
+const provider = new WebSocketProvider(ALCHEMY_WSS);
+const vault    = new Contract(ADDR.Vault,          ABI_VAULT,  provider);
+const router   = new Contract(ADDR.PositionRouter, ABI_ROUTER, provider);
 
-// Helpers
-function tokenSymbol(addr) {
-  for (const v of Object.values(TOKENS)) {
-    if (v.addr.toLowerCase() === addr.toLowerCase()) return v.symbol;
+const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
+
+// ======== Utils ========
+const short = (a) => a ? a.slice(0,6)+'…'+a.slice(-4) : '—';
+
+// convert BigInt(1e30) USD to display string
+function usd30ToStr(xBig) {
+  const n = Number(xBig); // ok for display; precision loss acceptable visually
+  return `$${(n / 1e30).toLocaleString(undefined,{maximumFractionDigits:2})}`;
+}
+
+// plain number from 1e30 fixed
+function from1e30(xBig) {
+  return Number(xBig) / 1e30;
+}
+
+function levStr(size30, coll30) {
+  const s = Number(size30);
+  const c = Number(coll30);
+  if (!c || c <= 0) return '—';
+  return (s / c).toFixed(1) + 'x';
+}
+
+async function send(text) {
+  try {
+    await bot.sendMessage(TG_CHAT_ID, text, { parse_mode: 'HTML', disable_web_page_preview: true });
+  } catch (e) {
+    console.error('Telegram send error:', e.message);
   }
-  return "UNKNOWN";
-}
-function fmtUsd(val) { return `$${Number(val / 1e30).toFixed(2)}`; }
-async function sendMsg(text) { await bot.sendMessage(chatId, text, { parse_mode: "HTML" }); }
-
-// 🔍 Parse Position
-async function parsePosition(account, collateralToken, indexToken, isLong) {
-  const [size, collateral, avgPrice,, , , , ] =
-    await vault.getPosition(account, collateralToken, indexToken, isLong);
-  if (size == 0n) return null;
-  const [hasProfit, delta] = await vault.getPositionDelta(account, collateralToken, indexToken, isLong);
-
-  const leverage = Number(size) / Number(collateral || 1n);
-  const pnlUsd = Number(delta) / 1e30;
-  const pnlColor = hasProfit ? "🟢" : "🔴";
-  const side = isLong ? "LONG" : "SHORT";
-
-  return {
-    side,
-    size: fmtUsd(size),
-    collateral: fmtUsd(collateral),
-    avgPrice: Number(avgPrice) / 1e30,
-    leverage: leverage.toFixed(1) + "x",
-    pnl: `${pnlColor} ${hasProfit ? "+" : "-"}$${Math.abs(pnlUsd).toFixed(2)}`
-  };
 }
 
-// 🚀 Events
-router.on("ExecuteIncreasePosition", async (account, path, indexToken, amountIn, minOut, sizeDelta, isLong, acceptablePrice, execFee, blockGap, timeGap, event) => {
-  const pos = await parsePosition(account, path[path.length-1], indexToken, isLong);
-  if (!pos) return;
-  await sendMsg(
-    `📈 <b>Increase ${pos.side}</b>\n` +
-    `• Trader: <code>${account}</code>\n` +
-    `• Pair: ${tokenSymbol(indexToken)}\n` +
-    `• Size: ${pos.size}\n` +
-    `• Collateral: ${pos.collateral}\n` +
-    `• Leverage: ${pos.leverage}\n` +
-    `• Entry Price: $${pos.avgPrice}\n` +
-    `• PnL: ${pos.pnl}\n` +
-    `🔗 <a href="https://bscscan.com/tx/${event.transactionHash}">tx</a>`
-  );
+async function pullPosition(account, collateralToken, indexToken, isLong) {
+  try {
+    const res = await vault.getPosition(account, collateralToken, indexToken, isLong);
+    const delta = await vault.getPositionDelta(account, collateralToken, indexToken, isLong);
+    const [size, collateral, avgPrice] = [res[0], res[1], res[2]];
+    const [hasProfit, pnl] = [delta[0], delta[1]];
+
+    if (size === 0n) return null;
+
+    return {
+      sizeStr: usd30ToStr(size),
+      collStr: usd30ToStr(collateral),
+      lev:     levStr(size, collateral),
+      entry:   from1e30(avgPrice),
+      pnlSign: hasProfit ? '🟢 +' : '🔴 -',
+      pnlStr:  `$${Math.abs(from1e30(pnl)).toLocaleString(undefined,{maximumFractionDigits:2})}`
+    };
+  } catch (e) {
+    console.error('pullPosition error:', e.message);
+    return null;
+  }
+}
+
+// ======== Subscriptions ========
+
+// OPEN / INCREASE
+router.on('ExecuteIncreasePosition', async (account, path, indexToken, amountIn, minOut, sizeDelta, isLong, acceptablePrice, executionFee, blockGap, timeGap, ev) => {
+  try {
+    const collateralToken = path[path.length - 1]; // matches PositionRouter internal logic
+    const p = await pullPosition(account, collateralToken, indexToken, isLong);
+    const side = isLong ? '🟢 LONG' : '🔴 SHORT';
+    const pair = sym(indexToken);
+
+    if (!p) {
+      await send(
+        `📈 <b>Increase ${side}</b>\n` +
+        `• Trader: <code>${account}</code>\n` +
+        `• Pair: ${pair}\n` +
+        `• Size Δ: ${usd30ToStr(sizeDelta)}\n` +
+        `🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`
+      );
+      return;
+    }
+
+    await send(
+      `📈 <b>Increase ${side}</b>\n` +
+      `• Trader: <code>${account}</code>\n` +
+      `• Pair: ${pair}\n` +
+      `• Size: ${p.sizeStr}\n` +
+      `• Collateral: ${p.collStr}\n` +
+      `• Leverage: ${p.lev}\n` +
+      `• Entry Price: $${p.entry.toLocaleString(undefined,{maximumFractionDigits:2})}\n` +
+      `• PnL: ${p.pnlSign}${p.pnlStr}\n` +
+      `🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`
+    );
+  } catch (e) {
+    console.error('Increase handler error:', e.message);
+  }
 });
 
-router.on("ExecuteDecreasePosition", async (account, path, indexToken, collDelta, sizeDelta, isLong, receiver, acceptablePrice, minOut, execFee, blockGap, timeGap, event) => {
-  const pos = await parsePosition(account, path[path.length-1], indexToken, isLong);
-  if (!pos) return;
-  await sendMsg(
-    `📉 <b>Decrease ${pos.side}</b>\n` +
-    `• Trader: <code>${account}</code>\n` +
-    `• Pair: ${tokenSymbol(indexToken)}\n` +
-    `• Size: ${pos.size}\n` +
-    `• Collateral: ${pos.collateral}\n` +
-    `• Leverage: ${pos.leverage}\n` +
-    `• Entry Price: $${pos.avgPrice}\n` +
-    `• PnL: ${pos.pnl}\n` +
-    `🔗 <a href="https://bscscan.com/tx/${event.transactionHash}">tx</a>`
-  );
+// CLOSE / DECREASE
+router.on('ExecuteDecreasePosition', async (account, path, indexToken, collateralDelta, sizeDelta, isLong, receiver, acceptablePrice, minOut, executionFee, blockGap, timeGap, ev) => {
+  try {
+    const collateralToken = path[path.length - 1];
+    const p = await pullPosition(account, collateralToken, indexToken, isLong);
+    const side = isLong ? '🟢 LONG' : '🔴 SHORT';
+    const pair = sym(indexToken);
+
+    // If fully closed, getPosition may still show size>0 until the same block settles; we still print what we have.
+    const sizeStr = usd30ToStr(sizeDelta);
+    const collBackStr = usd30ToStr(collateralDelta);
+
+    if (!p) {
+      await send(
+        `📉 <b>Decrease ${side}</b>\n` +
+        `• Trader: <code>${account}</code>\n` +
+        `• Pair: ${pair}\n` +
+        `• Size Δ: ${sizeStr}\n` +
+        `• Collateral Out: ${collBackStr}\n` +
+        `🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`
+      );
+      return;
+    }
+
+    await send(
+      `📉 <b>Decrease ${side}</b>\n` +
+      `• Trader: <code>${account}</code>\n` +
+      `• Pair: ${pair}\n` +
+      `• Size: ${p.sizeStr} (Δ ${sizeStr})\n` +
+      `• Collateral: ${p.collStr} (out ${collBackStr})\n` +
+      `• Leverage: ${p.lev}\n` +
+      `• Entry Price: $${p.entry.toLocaleString(undefined,{maximumFractionDigits:2})}\n` +
+      `• PnL: ${p.pnlSign}${p.pnlStr}\n` +
+      `🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`
+    );
+  } catch (e) {
+    console.error('Decrease handler error:', e.message);
+  }
 });
 
-vault.on("LiquidatePosition", async (key, account, collateralToken, indexToken, isLong, size, collateral, reserveAmt, realisedPnl, markPrice, event) => {
-  await sendMsg(
-    `💀 <b>Liquidation</b>\n` +
-    `• Trader: <code>${account}</code>\n` +
-    `• Pair: ${tokenSymbol(indexToken)}\n` +
-    `• Side: ${isLong ? "LONG" : "SHORT"}\n` +
-    `• Size: ${fmtUsd(size)}\n` +
-    `• Collateral: ${fmtUsd(collateral)}\n` +
-    `• Mark Price: $${Number(markPrice) / 1e30}\n` +
-    `🔗 <a href="https://bscscan.com/tx/${event.transactionHash}">tx</a>`
-  );
+// LIQUIDATION
+vault.on('LiquidatePosition', async (key, account, collateralToken, indexToken, isLong, size, collateral, reserveAmount, realisedPnl, markPrice, ev) => {
+  try {
+    const pair = sym(indexToken);
+    const side = isLong ? 'LONG' : 'SHORT';
+    await send(
+      `💥 <b>LIQUIDATION</b>\n` +
+      `• Trader: <code>${account}</code>\n` +
+      `• Pair: ${pair} — ${side}\n` +
+      `• Size: ${usd30ToStr(size)}\n` +
+      `• Collateral: ${usd30ToStr(collateral)}\n` +
+      `• Mark Price: $${from1e30(markPrice).toLocaleString(undefined,{maximumFractionDigits:2})}\n` +
+      `🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`
+    );
+  } catch (e) {
+    console.error('Liquidation handler error:', e.message);
+  }
 });
 
-console.log("🚀 MoneyX TG bot live (Vault + Router events, exact leverage & PnL)");
+// ======== Provider lifecycle logs ========
+provider.on('error', (e) => console.error('WS error:', e?.message || e));
+provider.on('close', () => console.error('WS closed — provider will not reconnect automatically on ethers v6'));
+console.log('🚀 MoneyX TG bot live — listening (Router + Vault)');
+
+// Send a boot ping so you know TG works:
+send('✅ MoneyX bot online — listening for trades…').catch(()=>{});
