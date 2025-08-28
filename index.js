@@ -1,3 +1,5 @@
+// MoneyX Trades TG Bot — Stable + BTC Support 🚀
+
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -8,7 +10,7 @@ const {
   TG_BOT_TOKEN,
   TG_CHAT_ID,
   SUBGRAPH_URL,
-  POLL_INTERVAL_MS = '15000',
+  POLL_INTERVAL_MS = '30000', // poll every 30s (gentle on thegraph)
   EXPLORER_TX_BASE = 'https://bscscan.com/tx/',
   CMC_API_KEY,
 } = process.env;
@@ -35,6 +37,7 @@ function saveState() {
 }
 
 // ---------- Helpers ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (addr) => (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : '');
 const fmtUsd = (v) =>
   v == null ? '—' : `$${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
@@ -45,7 +48,7 @@ const calcLev = (size, coll) => (!size || !coll ? '—' : (size / coll).toFixed(
 const scale1e30 = (v) => Number(v) / 1e30;
 const scale1e18 = (v) => Number(v) / 1e18;
 
-// Token symbols
+// Supported tokens (BNB, ETH, DOGE, XRP, BTC, USDC)
 const SYMBOLS = {
   '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': 'BNB',
   '0x2170ed0880ac9a755fd29b2688956bd959f933f8': 'ETH',
@@ -62,21 +65,16 @@ async function getPrice(symbol) {
   if (PRICE_CACHE[symbol] && Date.now() - PRICE_CACHE[symbol].ts < 60000) {
     return PRICE_CACHE[symbol].usd;
   }
-  try {
-    const res = await axios.get(
-      'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest',
-      {
-        params: { symbol, convert: 'USD' },
-        headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
-      }
-    );
-    const usd = res.data.data[symbol].quote.USD.price;
-    PRICE_CACHE[symbol] = { usd, ts: Date.now() };
-    return usd;
-  } catch (e) {
-    console.error('CMC price fetch failed:', e.message);
-    return null;
-  }
+  const res = await axios.get(
+    'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest',
+    {
+      params: { symbol, convert: 'USD' },
+      headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY },
+    }
+  );
+  const usd = res.data.data[symbol].quote.USD.price;
+  PRICE_CACHE[symbol] = { usd, ts: Date.now() };
+  return usd;
 }
 async function getTokenPriceUsd(addr) {
   const s = SYMBOLS[addr?.toLowerCase()];
@@ -94,8 +92,7 @@ async function fetchUserStat(account) {
   try {
     const res = await axios.post(SUBGRAPH_URL, { query: q });
     return res.data?.data?.userStat || null;
-  } catch (e) {
-    console.error('userStat fetch error:', e.message);
+  } catch {
     return null;
   }
 }
@@ -107,7 +104,7 @@ function renderUserStats(stats) {
 • Swaps: ${stats.actionSwapCount}`;
 }
 
-// ---------- Renderer ----------
+// ---------- Renderers ----------
 function renderIncrease(rec, stats) {
   const whale = rec.size > 10000 ? ' 🐳' : '';
   return `${whale} 📈 Increase ${rec.isLong ? '🟢 LONG' : '🔴 SHORT'}
@@ -120,7 +117,6 @@ function renderIncrease(rec, stats) {
     rec.tx ? `\n🔗 tx: ${EXPLORER_TX_BASE}${rec.tx}` : ''
   }${renderUserStats(stats)}`;
 }
-
 function renderDecrease(rec, stats) {
   return rec.pnlUsd > 0
     ? `💰 Close 🟢 PROFIT
@@ -132,7 +128,6 @@ function renderDecrease(rec, stats) {
 • Pair: ${sym(rec.indexToken)}-USD
 • Wallet: ${short(rec.account)}${renderUserStats(stats)}`;
 }
-
 function renderLiquidation(rec, stats) {
   return `💥 LIQUIDATION ALERT 💥
 • Wallet REKT: ${short(rec.account)}
@@ -142,53 +137,37 @@ function renderLiquidation(rec, stats) {
 🚑 Better luck next time...${renderUserStats(stats)}`;
 }
 
-// ---------- Queries ----------
-async function fetchIncrease(since) {
-  const q = `{ createIncreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
-    id account indexToken collateralToken isLong sizeDelta amountIn acceptablePrice transaction timestamp
-  } }`;
-  try {
-    const res = await axios.post(SUBGRAPH_URL, { query: q });
-    return res.data?.data?.createIncreasePositions || [];
-  } catch (e) {
-    console.error('fetchIncrease error:', e.message);
-    return [];
-  }
-}
-async function fetchDecrease(since) {
-  const q = `{ createDecreasePositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
-    id account indexToken collateralToken isLong sizeDelta acceptablePrice transaction timestamp
-  } }`;
-  try {
-    const res = await axios.post(SUBGRAPH_URL, { query: q });
-    return res.data?.data?.createDecreasePositions || [];
-  } catch (e) {
-    console.error('fetchDecrease error:', e.message);
-    return [];
-  }
-}
-async function fetchLiquidations(since) {
-  const q = `{ liquidatedPositions(first: 50, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
-    id account indexToken collateralToken isLong size collateral markPrice averagePrice loss timestamp
-  } }`;
-  try {
-    const res = await axios.post(SUBGRAPH_URL, { query: q });
-    return res.data?.data?.liquidatedPositions || [];
-  } catch (e) {
-    console.error('fetchLiquidations error:', e.message);
-    return [];
-  }
-}
-async function fetchActivePosition(account, indexToken, isLong) {
-  const q = `{ activePositions(where: { account: "${account}", indexToken: "${indexToken}", isLong: ${isLong} }) {
-    averagePrice size collateral
-  } }`;
-  try {
-    const res = await axios.post(SUBGRAPH_URL, { query: q });
-    return res.data?.data?.activePositions?.[0] || null;
-  } catch (e) {
-    console.error('fetchActivePosition error:', e.message);
-    return null;
+// ---------- Query (batched) ----------
+async function fetchEvents(since) {
+  const q = `{
+    createIncreasePositions(first: 30, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
+      id account indexToken collateralToken isLong sizeDelta amountIn acceptablePrice transaction timestamp
+    }
+    createDecreasePositions(first: 30, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
+      id account indexToken collateralToken isLong sizeDelta acceptablePrice transaction timestamp
+    }
+    liquidatedPositions(first: 30, orderBy: timestamp, orderDirection: asc, where: { timestamp_gt: ${since} }) {
+      id account indexToken collateralToken isLong size collateral markPrice averagePrice loss timestamp
+    }
+  }`;
+
+  let retries = 0;
+  while (true) {
+    try {
+      const res = await axios.post(SUBGRAPH_URL, { query: q });
+      if (res.data.errors) throw new Error(JSON.stringify(res.data.errors));
+      return res.data.data;
+    } catch (e) {
+      retries++;
+      if (e.response && e.response.status === 429) {
+        const wait = Math.min(60000, 2000 * retries); // exponential backoff up to 60s
+        console.warn(`⏳ Rate limited (429). Retrying in ${wait / 1000}s`);
+        await sleep(wait);
+        continue;
+      }
+      console.error('fetchEvents error:', e.message);
+      return { createIncreasePositions: [], createDecreasePositions: [], liquidatedPositions: [] };
+    }
   }
 }
 
@@ -212,21 +191,15 @@ async function handleIncrease(r) {
     timestamp: Number(r.timestamp),
   };
 }
-
 async function handleDecrease(r) {
   const size = scale1e30(r.sizeDelta);
-  const active = await fetchActivePosition(r.account, r.indexToken, r.isLong);
-  if (!active) return null;
-
-  const entry = scale1e30(active.averagePrice);
   const current = await getTokenPriceUsd(r.indexToken);
-  if (!entry || !current) return null;
-
+  if (!current) return null;
+  // without entry avg, we estimate from acceptablePrice
+  const entry = scale1e30(r.acceptablePrice);
   const delta = r.isLong ? current - entry : entry - current;
   const pnlUsd = (delta / entry) * size;
-  const collUsd = scale1e30(active.collateral);
-  const pnlPct = collUsd ? (pnlUsd / collUsd) * 100 : 0;
-
+  const pnlPct = (pnlUsd / size) * 100;
   return {
     id: r.id,
     account: r.account,
@@ -238,7 +211,6 @@ async function handleDecrease(r) {
     timestamp: Number(r.timestamp),
   };
 }
-
 async function handleLiquidation(r) {
   const size = scale1e30(r.size);
   const collAmount = scale1e18(r.collateral);
@@ -265,7 +237,9 @@ async function runOnce() {
   const since = state.lastTs || 0;
   let newest = since;
 
-  for (const r of await fetchIncrease(since)) {
+  const data = await fetchEvents(since);
+
+  for (const r of data.createIncreasePositions) {
     if (state.seen[r.id]) continue;
     const rec = await handleIncrease(r);
     const stats = await fetchUserStat(r.account);
@@ -274,7 +248,7 @@ async function runOnce() {
     newest = Math.max(newest, rec.timestamp);
   }
 
-  for (const r of await fetchDecrease(since)) {
+  for (const r of data.createDecreasePositions) {
     if (state.seen[r.id]) continue;
     const rec = await handleDecrease(r);
     if (rec) {
@@ -285,7 +259,7 @@ async function runOnce() {
     }
   }
 
-  for (const r of await fetchLiquidations(since)) {
+  for (const r of data.liquidatedPositions) {
     if (state.seen[r.id]) continue;
     const rec = await handleLiquidation(r);
     const stats = await fetchUserStat(r.account);
@@ -294,7 +268,6 @@ async function runOnce() {
     newest = Math.max(newest, rec.timestamp);
   }
 
-  // ✅ bump timestamp so same events aren’t re-fetched
   state.lastTs = Math.max(newest, since) + 1;
   saveState();
 }
