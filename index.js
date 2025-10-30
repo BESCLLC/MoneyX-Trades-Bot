@@ -1,14 +1,18 @@
+// ✅ MoneyX Trade Relay v6 — adds live mark price + trader win-rate
 require("dotenv").config();
 const { WebSocketProvider, Contract } = require("ethers");
 const TelegramBot = require("node-telegram-bot-api");
 const { request, gql } = require("graphql-request");
+
+if (global.__MONEYX_BOT_STARTED) process.exit(0);
+global.__MONEYX_BOT_STARTED = true;
 
 // ===== CONFIG =====
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const ALCHEMY_WSS = "wss://bnb-mainnet.g.alchemy.com/v2/4Vvah0kUdr9X91EP08ZRZ";
 if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-  console.error("Missing .env vars");
+  console.error("❌ Missing .env vars");
   process.exit(1);
 }
 
@@ -39,10 +43,10 @@ const TOKENS = {
   USDC: { addr: "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", emoji: "💵" },
 };
 function sym(addr) {
-  const found = Object.entries(TOKENS).find(
+  const f = Object.entries(TOKENS).find(
     ([, t]) => t.addr.toLowerCase() === (addr || "").toLowerCase()
   );
-  return found ? `${found[1].emoji} ${found[0]}` : addr.slice(0, 6) + "…" + addr.slice(-4);
+  return f ? `${f[1].emoji} ${f[0]}` : addr?.slice(0, 6) + "…" + addr?.slice(-4);
 }
 
 // ===== ABIs =====
@@ -81,7 +85,7 @@ function pnlEmoji(pct) {
   return "⚪";
 }
 
-// ===== SUBGRAPH DATA =====
+// ===== SUBGRAPH HELPERS =====
 const STATS_QUERY = gql`
   {
     tradingStats(first: 1, orderBy: timestamp, orderDirection: desc) {
@@ -97,16 +101,56 @@ const STATS_QUERY = gql`
 `;
 async function getStats() {
   try {
-    const res = await request(ENDPOINTS.stats, STATS_QUERY);
-    const t = res.tradingStats?.[0];
-    const v = res.volumeStats?.[0];
+    const r = await request(ENDPOINTS.stats, STATS_QUERY);
+    const t = r.tradingStats?.[0];
+    const v = r.volumeStats?.[0];
     return {
       oiLong: t ? `$${numFmt(Number(t.longOpenInterest) / 1e30)}` : "—",
       oiShort: t ? `$${numFmt(Number(t.shortOpenInterest) / 1e30)}` : "—",
-      vol24h: v ? `$${numFmt((Number(v.swap) + Number(v.margin) + Number(v.liquidation)) / 1e30)}` : "—",
+      vol24h: v
+        ? `$${numFmt(
+            (Number(v.swap) + Number(v.margin) + Number(v.liquidation)) / 1e30
+          )}`
+        : "—",
     };
   } catch {
     return { oiLong: "—", oiShort: "—", vol24h: "—" };
+  }
+}
+
+// ---- New helper: live mark price
+async function getTokenPrice(token) {
+  try {
+    const q = gql`{ chainlinkPrices(first:1, where:{token:"${token.toLowerCase()}"}, orderBy:timestamp, orderDirection:desc){ value } }`;
+    const r = await request(ENDPOINTS.stats, q);
+    return r.chainlinkPrices?.[0]?.value
+      ? Number(r.chainlinkPrices[0].value) / 1e30
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---- New helper: trader win-rate
+const USER_QUERY = gql`
+  query ($id: String!) {
+    userStats(where: { id: $id }, orderBy: timestamp, orderDirection: desc, first: 1) {
+      profitCumulative
+      lossCumulative
+    }
+  }
+`;
+async function getUserStats(addr) {
+  try {
+    const r = await request(ENDPOINTS.trades, USER_QUERY, { id: addr.toLowerCase() });
+    const u = r.userStats?.[0];
+    if (!u) return null;
+    const wins = Number(u.profitCumulative) / 1e30;
+    const losses = Number(u.lossCumulative) / 1e30;
+    const rate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
+    return { rate: rate.toFixed(1), wins: numFmt(wins), losses: numFmt(losses) };
+  } catch {
+    return null;
   }
 }
 
@@ -114,7 +158,10 @@ async function getStats() {
 const bot = new TelegramBot(TG_BOT_TOKEN, { polling: false });
 async function send(msg) {
   try {
-    await bot.sendMessage(TG_CHAT_ID, msg, { parse_mode: "HTML", disable_web_page_preview: true });
+    await bot.sendMessage(TG_CHAT_ID, msg, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
   } catch (e) {
     console.error("TG send error:", e.message);
   }
@@ -133,8 +180,10 @@ async function getPosition(vault, account, coll, index, isLong) {
       size: usdFmt(size),
       coll: usdFmt(collateral),
       lev: lev(size, collateral),
-      entry: "$" + (Number(avg) / 1e30).toFixed(2),
-      pnl: `${pnlEmoji(pct / 100)} ${hasProfit ? "+" : "-"}$${numFmt(Math.abs(Number(pnl) / 1e30))} (${pct.toFixed(2)}%)`,
+      entry: Number(avg) / 1e30,
+      pnl: `${pnlEmoji(pct / 100)} ${hasProfit ? "+" : "-"}$${numFmt(
+        Math.abs(Number(pnl) / 1e30)
+      )} (${pct.toFixed(2)}%)`,
     };
   } catch (e) {
     console.error("getPosition error:", e.message);
@@ -142,62 +191,105 @@ async function getPosition(vault, account, coll, index, isLong) {
   }
 }
 
+// ===== CONNECT =====
 async function connect() {
   const provider = new WebSocketProvider(ALCHEMY_WSS);
   const vault = new Contract(ADDR.Vault, ABI_VAULT, provider);
   const router = new Contract(ADDR.PositionRouter, ABI_ROUTER, provider);
 
-  console.log("🚀 MoneyX Relay v5 online");
-  await send("✅ <b>MoneyX Trade Relay v5</b> is online — monitoring live positions.");
+  console.log("🚀 MoneyX Relay v6 online");
+  if (!global.__MONEYX_BOT_ANNOUNCED) {
+    await send("✅ <b>MoneyX Trade Relay v6</b> is online — monitoring live positions.");
+    global.__MONEYX_BOT_ANNOUNCED = true;
+  }
 
   const stats = await getStats();
 
   // 📈 INCREASE
-  router.on(
-    "ExecuteIncreasePosition",
-    async (account, path, indexToken, amountIn, minOut, sizeDelta, isLong, acceptablePrice, execFee, blockGap, timeGap, ev) => {
-      const collToken = path[path.length - 1];
-      const p = await getPosition(vault, account, collToken, indexToken, isLong);
-      const pair = sym(indexToken);
-      const side = isLong ? "🟢 LONG" : "🔴 SHORT";
-      const msg = `📈 <b>${pair} ${side}</b> | ${p?.lev || "—"}\n💰 Size ${p?.size || usdFmt(sizeDelta)} Coll ${p?.coll || "—"}\n🎯 Entry ${p?.entry || "—"} Fee $${(Number(execFee) / 1e18).toFixed(2)}\n📊 PnL ${p?.pnl || "—"}\n📈 OI L ${stats.oiLong} OI S ${stats.oiShort}\n💹 24 h Vol ${stats.vol24h}\n👤 ${walletTag(account)}\n🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
-      await send(msg);
-    }
-  );
+  router.on("ExecuteIncreasePosition", async (...args) => {
+    const [account, path, indexToken, , , sizeDelta, isLong, , execFee, , , ev] =
+      args;
+    const collToken = path[path.length - 1];
+    const p = await getPosition(vault, account, collToken, indexToken, isLong);
+    const mark = await getTokenPrice(indexToken);
+    const deltaPct =
+      mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
+    const win = await getUserStats(account);
+    const pair = sym(indexToken);
+    const side = isLong ? "🟢 LONG" : "🔴 SHORT";
+    const msg = `📈 <b>${pair} ${side}</b> | ${p?.lev || "—"}\n💰 Size ${
+      p?.size || usdFmt(sizeDelta)
+    }  Coll ${p?.coll || "—"}\n🎯 Entry $${p?.entry?.toFixed(2) || "—"}  📊 Mark ${
+      mark ? mark.toFixed(2) : "—"
+    }${deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)} %)` : ""}\n📈 PnL ${
+      p?.pnl || "—"
+    }\n🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}\n📈 OI L ${
+      stats.oiLong
+    }  OI S ${stats.oiShort}\n💹 24 h Vol ${stats.vol24h}\n👤 ${walletTag(
+      account
+    )}\n🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+    await send(msg);
+  });
 
   // 📉 DECREASE
-  router.on(
-    "ExecuteDecreasePosition",
-    async (account, path, indexToken, collDelta, sizeDelta, isLong, receiver, acceptablePrice, minOut, execFee, blockGap, timeGap, ev) => {
-      const collToken = path[path.length - 1];
-      const p = await getPosition(vault, account, collToken, indexToken, isLong);
-      const pair = sym(indexToken);
-      const side = isLong ? "🟢 LONG" : "🔴 SHORT";
-      const msg = `📉 <b>${pair} ${side}</b> | ${p?.lev || "—"}\n💰 Size Δ ${usdFmt(sizeDelta)} Coll Out ${usdFmt(collDelta)}\n🎯 Entry ${p?.entry || "—"} Fee $${(Number(execFee) / 1e18).toFixed(2)}\n📊 PnL ${p?.pnl || "—"}\n📈 OI L ${stats.oiLong} OI S ${stats.oiShort}\n💹 24 h Vol ${stats.vol24h}\n👤 ${walletTag(account)}\n🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
-      await send(msg);
-    }
-  );
+  router.on("ExecuteDecreasePosition", async (...args) => {
+    const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , execFee, , , ev] =
+      args;
+    const collToken = path[path.length - 1];
+    const p = await getPosition(vault, account, collToken, indexToken, isLong);
+    const mark = await getTokenPrice(indexToken);
+    const deltaPct =
+      mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
+    const win = await getUserStats(account);
+    const pair = sym(indexToken);
+    const side = isLong ? "🟢 LONG" : "🔴 SHORT";
+    const msg = `📉 <b>${pair} ${side}</b> | ${p?.lev || "—"}\n💰 Size Δ ${usdFmt(
+      sizeDelta
+    )}  Coll Out ${usdFmt(collDelta)}\n🎯 Entry $${p?.entry?.toFixed(2) ||
+      "—"}  📊 Mark ${
+      mark ? mark.toFixed(2) : "—"
+    }${deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)} %)` : ""}\n📈 PnL ${
+      p?.pnl || "—"
+    }\n🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}\n📈 OI L ${
+      stats.oiLong
+    }  OI S ${stats.oiShort}\n💹 24 h Vol ${stats.vol24h}\n👤 ${walletTag(
+      account
+    )}\n🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+    await send(msg);
+  });
 
   // 💥 LIQUIDATION
   vault.on(
     "LiquidatePosition",
-    async (key, account, collToken, indexToken, isLong, size, collateral, reserve, realised, mark, ev) => {
+    async (key, account, collToken, indexToken, isLong, size, collateral, , , mark, ev) => {
       const pair = sym(indexToken);
-      const msg = `💥 <b>LIQUIDATION</b>\n${pair} | ${isLong ? "LONG" : "SHORT"}\n💰 Size ${usdFmt(size)} Coll ${usdFmt(collateral)}\n💸 Mark $${(Number(mark) / 1e30).toFixed(2)}\n📈 OI L ${(await getStats()).oiLong} OI S ${(await getStats()).oiShort}\n👤 ${walletTag(account)}\n🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+      const msg = `💥 <b>LIQUIDATION</b>\n${pair} | ${
+        isLong ? "LONG" : "SHORT"
+      }\n💰 Size ${usdFmt(size)}  Coll ${usdFmt(collateral)}\n💸 Mark $${(
+        Number(mark) / 1e30
+      ).toFixed(2)}\n📈 OI L ${(await getStats()).oiLong}  OI S ${
+        (await getStats()).oiShort
+      }\n👤 ${walletTag(account)}\n🔗 <a href="https://bscscan.com/tx/${
+        ev.transactionHash
+      }">tx</a>`;
       await send(msg);
     }
   );
 
-  // Reconnect logic
+  // Reconnect
   if (provider._ws) {
     provider._ws.on("close", () => {
-      console.error("WS closed, reconnecting in 5 s…");
+      console.error("⚠️ WS closed – reconnecting in 5 s…");
       setTimeout(connect, 5000);
     });
-    provider._ws.on("error", (err) => {
-      console.error("WS error:", err.message);
-    });
+    provider._ws.on("error", (err) => console.error("WS error:", err.message));
   }
 }
 
-connect();
+// heartbeat
+setInterval(() => console.log("💤 heartbeat"), 5 * 60 * 1000);
+
+connect().catch((e) => {
+  console.error("❌ Fatal:", e);
+  setTimeout(connect, 10000);
+});
