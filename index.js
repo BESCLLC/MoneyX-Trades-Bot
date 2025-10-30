@@ -261,12 +261,24 @@ async function connect() {
   // 💥 LIQUIDATION
   vault.on(
     "LiquidatePosition",
-    async (key, account, collToken, indexToken, isLong, size, collateral, , , mark, ev) => {
+    async (
+      key,
+      account,
+      collToken,
+      indexToken,
+      isLong,
+      size,
+      collateral,
+      reserveAmount,
+      realisedPnl,
+      markPrice,
+      ev
+    ) => {
       const pair = sym(indexToken);
       const msg = `💥 <b>LIQUIDATION</b>\n${pair} | ${
         isLong ? "LONG" : "SHORT"
       }\n💰 Size ${usdFmt(size)}  Coll ${usdFmt(collateral)}\n💸 Mark $${(
-        Number(mark) / 1e30
+        Number(markPrice) / 1e30
       ).toFixed(2)}\n📈 OI L ${(await getStats()).oiLong}  OI S ${
         (await getStats()).oiShort
       }\n👤 ${walletTag(account)}\n🔗 <a href="https://bscscan.com/tx/${
