@@ -1,13 +1,3 @@
-/**
- * 💎 MoneyX Trade Relay v5 — Binance-Grade Edition
- * Full visual polish + on-chain + subgraph fusion
- * ------------------------------------------------
- * ENV:
- *   TG_BOT_TOKEN=xxx
- *   TG_CHAT_ID=xxx
- * ------------------------------------------------
- */
-
 require("dotenv").config();
 const { WebSocketProvider, Contract } = require("ethers");
 const TelegramBot = require("node-telegram-bot-api");
