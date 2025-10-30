@@ -1,4 +1,4 @@
-// ✅ MoneyX Trade Relay v6 — adds live mark price + trader win-rate
+// ✅ MoneyX Trade Relay v6.4 — adds improved mark price, trader win/loss ratio, and liquidation loss display
 require("dotenv").config();
 const { WebSocketProvider, Contract } = require("ethers");
 const TelegramBot = require("node-telegram-bot-api");
@@ -118,10 +118,19 @@ async function getStats() {
   }
 }
 
-// ---- New helper: live mark price
+// ---- Updated live mark price
 async function getTokenPrice(token) {
   try {
-    const q = gql`{ chainlinkPrices(first:1, where:{token:"${token.toLowerCase()}"}, orderBy:timestamp, orderDirection:desc){ value } }`;
+    const q = gql`{
+      chainlinkPrices(
+        first: 1,
+        where: { token: "${token.toLowerCase()}" },
+        orderBy: timestamp,
+        orderDirection: desc
+      ) {
+        value
+      }
+    }`;
     const r = await request(ENDPOINTS.stats, q);
     return r.chainlinkPrices?.[0]?.value
       ? Number(r.chainlinkPrices[0].value) / 1e30
@@ -131,10 +140,15 @@ async function getTokenPrice(token) {
   }
 }
 
-// ---- New helper: trader win-rate
+// ---- Updated trader win-rate (handles new traders)
 const USER_QUERY = gql`
   query ($id: String!) {
-    userStats(where: { id: $id }, orderBy: timestamp, orderDirection: desc, first: 1) {
+    userStats(
+      where: { id: $id },
+      orderBy: timestamp,
+      orderDirection: desc,
+      first: 1
+    ) {
       profitCumulative
       lossCumulative
     }
@@ -144,13 +158,13 @@ async function getUserStats(addr) {
   try {
     const r = await request(ENDPOINTS.trades, USER_QUERY, { id: addr.toLowerCase() });
     const u = r.userStats?.[0];
-    if (!u) return null;
+    if (!u) return { rate: "0.0", wins: "0", losses: "0" };
     const wins = Number(u.profitCumulative) / 1e30;
     const losses = Number(u.lossCumulative) / 1e30;
     const rate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
     return { rate: rate.toFixed(1), wins: numFmt(wins), losses: numFmt(losses) };
   } catch {
-    return null;
+    return { rate: "—", wins: "—", losses: "—" };
   }
 }
 
@@ -197,9 +211,9 @@ async function connect() {
   const vault = new Contract(ADDR.Vault, ABI_VAULT, provider);
   const router = new Contract(ADDR.PositionRouter, ABI_ROUTER, provider);
 
-  console.log("🚀 MoneyX Relay v6 online");
+  console.log("🚀 MoneyX Relay v6.4 online");
   if (!global.__MONEYX_BOT_ANNOUNCED) {
-    await send("✅ <b>MoneyX Trade Relay v6</b> is online — monitoring live positions.");
+    await send("✅ <b>MoneyX Trade Relay v6.4</b> is online — monitoring live positions.");
     global.__MONEYX_BOT_ANNOUNCED = true;
   }
 
@@ -207,58 +221,53 @@ async function connect() {
 
   // 📈 INCREASE
   router.on("ExecuteIncreasePosition", async (...args) => {
-    const [account, path, indexToken, , , sizeDelta, isLong, , execFee, , , ev] =
-      args;
+    const [account, path, indexToken, , , sizeDelta, isLong, , , , , , ev] = args;
     const collToken = path[path.length - 1];
     const p = await getPosition(vault, account, collToken, indexToken, isLong);
     const mark = await getTokenPrice(indexToken);
-    const deltaPct =
-      mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
+    const deltaPct = mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
     const win = await getUserStats(account);
     const pair = sym(indexToken);
     const side = isLong ? "🟢 LONG" : "🔴 SHORT";
-    const msg = `📈 <b>${pair} ${side}</b> | ${p?.lev || "—"}\n💰 Size ${
-      p?.size || usdFmt(sizeDelta)
-    }  Coll ${p?.coll || "—"}\n🎯 Entry $${p?.entry?.toFixed(2) || "—"}  📊 Mark ${
-      mark ? mark.toFixed(2) : "—"
-    }${deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)} %)` : ""}\n📈 PnL ${
-      p?.pnl || "—"
-    }\n🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}\n📈 OI L ${
-      stats.oiLong
-    }  OI S ${stats.oiShort}\n💹 24 h Vol ${stats.vol24h}\n👤 ${walletTag(
-      account
-    )}\n🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+    const msg = `📈 <b>${pair} ${side}</b> | ${p?.lev || "—"}
+💰 Size ${p?.size || usdFmt(sizeDelta)} Coll ${p?.coll || "—"}
+🎯 Entry $${p?.entry?.toFixed(2) || "—"} 📊 Mark ${mark ? mark.toFixed(2) : "—"}${
+      deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)}%)` : ""
+    }
+📈 PnL ${p?.pnl || "—"}
+🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}
+📈 OI L ${stats.oiLong} OI S ${stats.oiShort}
+💹 24 h Vol ${stats.vol24h}
+👤 ${walletTag(account)}
+🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
     await send(msg);
   });
 
   // 📉 DECREASE
   router.on("ExecuteDecreasePosition", async (...args) => {
-    const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , execFee, , , ev] =
-      args;
+    const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , , , , ev] = args;
     const collToken = path[path.length - 1];
     const p = await getPosition(vault, account, collToken, indexToken, isLong);
     const mark = await getTokenPrice(indexToken);
-    const deltaPct =
-      mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
+    const deltaPct = mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
     const win = await getUserStats(account);
     const pair = sym(indexToken);
     const side = isLong ? "🟢 LONG" : "🔴 SHORT";
-    const msg = `📉 <b>${pair} ${side}</b> | ${p?.lev || "—"}\n💰 Size Δ ${usdFmt(
-      sizeDelta
-    )}  Coll Out ${usdFmt(collDelta)}\n🎯 Entry $${p?.entry?.toFixed(2) ||
-      "—"}  📊 Mark ${
-      mark ? mark.toFixed(2) : "—"
-    }${deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)} %)` : ""}\n📈 PnL ${
-      p?.pnl || "—"
-    }\n🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}\n📈 OI L ${
-      stats.oiLong
-    }  OI S ${stats.oiShort}\n💹 24 h Vol ${stats.vol24h}\n👤 ${walletTag(
-      account
-    )}\n🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+    const msg = `📉 <b>${pair} ${side}</b> | ${p?.lev || "—"}
+💰 Size Δ ${usdFmt(sizeDelta)} Coll Out ${usdFmt(collDelta)}
+🎯 Entry $${p?.entry?.toFixed(2) || "—"} 📊 Mark ${mark ? mark.toFixed(2) : "—"}${
+      deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)}%)` : ""
+    }
+📈 PnL ${p?.pnl || "—"}
+🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}
+📈 OI L ${stats.oiLong} OI S ${stats.oiShort}
+💹 24 h Vol ${stats.vol24h}
+👤 ${walletTag(account)}
+🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
     await send(msg);
   });
 
-  // 💥 LIQUIDATION
+  // 💥 LIQUIDATION (improved)
   vault.on(
     "LiquidatePosition",
     async (
@@ -275,15 +284,18 @@ async function connect() {
       ev
     ) => {
       const pair = sym(indexToken);
-      const msg = `💥 <b>LIQUIDATION</b>\n${pair} | ${
-        isLong ? "LONG" : "SHORT"
-      }\n💰 Size ${usdFmt(size)}  Coll ${usdFmt(collateral)}\n💸 Mark $${(
-        Number(markPrice) / 1e30
-      ).toFixed(2)}\n📈 OI L ${(await getStats()).oiLong}  OI S ${
-        (await getStats()).oiShort
-      }\n👤 ${walletTag(account)}\n🔗 <a href="https://bscscan.com/tx/${
-        ev.transactionHash
-      }">tx</a>`;
+      const lossUsd = Math.abs(Number(realisedPnl) / 1e30);
+      const lossPct =
+        Number(collateral) > 0
+          ? ((lossUsd / (Number(collateral) / 1e30)) * 100).toFixed(2)
+          : "—";
+      const msg = `💥 <b>LIQUIDATION</b>
+${pair} | ${isLong ? "LONG" : "SHORT"}
+💰 Size ${usdFmt(size)} Coll ${usdFmt(collateral)}
+💸 Mark $${(Number(markPrice) / 1e30).toFixed(2)} 💀 Loss −$${numFmt(lossUsd)} (${lossPct}%)
+📈 OI L ${(await getStats()).oiLong} OI S ${(await getStats()).oiShort}
+👤 ${walletTag(account)}
+🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
       await send(msg);
     }
   );
@@ -298,7 +310,7 @@ async function connect() {
   }
 }
 
-// heartbeat
+// Heartbeat
 setInterval(() => console.log("💤 heartbeat"), 5 * 60 * 1000);
 
 connect().catch((e) => {
