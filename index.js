@@ -1,4 +1,4 @@
-// ✅ MoneyX Trade Relay v6.4 — adds improved mark price, trader win/loss ratio, and liquidation loss display
+// ✅ MoneyX Trade Relay v6.5 — fixes blank entry/mark/collOut on close, accurate PnL + loss fallback
 require("dotenv").config();
 const { WebSocketProvider, Contract } = require("ethers");
 const TelegramBot = require("node-telegram-bot-api");
@@ -118,7 +118,7 @@ async function getStats() {
   }
 }
 
-// ---- Updated live mark price
+// ---- live mark price
 async function getTokenPrice(token) {
   try {
     const q = gql`{
@@ -140,7 +140,7 @@ async function getTokenPrice(token) {
   }
 }
 
-// ---- Trader win-rate (from stats subgraph)
+// ---- win-rate
 const USER_QUERY = gql`
   {
     tradingStats(first: 1, orderBy: timestamp, orderDirection: desc) {
@@ -206,15 +206,15 @@ async function connect() {
   const vault = new Contract(ADDR.Vault, ABI_VAULT, provider);
   const router = new Contract(ADDR.PositionRouter, ABI_ROUTER, provider);
 
-  console.log("🚀 MoneyX Relay v6.4 online");
+  console.log("🚀 MoneyX Relay v6.5 online");
   if (!global.__MONEYX_BOT_ANNOUNCED) {
-    await send("✅ <b>MoneyX Trade Relay v6.4</b> is online — monitoring live positions.");
+    await send("✅ <b>MoneyX Trade Relay v6.5</b> is online — monitoring live positions.");
     global.__MONEYX_BOT_ANNOUNCED = true;
   }
 
   const stats = await getStats();
 
-  // 📈 INCREASE
+  // 📈 INCREASE (same)
   router.on("ExecuteIncreasePosition", async (...args) => {
     const [account, path, indexToken, , , sizeDelta, isLong, , , , , , maybeEv] = args;
     const ev = args[args.length - 1] || maybeEv;
@@ -231,7 +231,7 @@ async function connect() {
       deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)}%)` : ""
     }
 📈 PnL ${p?.pnl || "—"}
-🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}
+🏅 Trader Win-Rate ${win.rate}% (${win.wins} W / ${win.losses} L)
 📈 OI L ${stats.oiLong} OI S ${stats.oiShort}
 💹 24 h Vol ${stats.vol24h}
 👤 ${walletTag(account)}
@@ -239,24 +239,29 @@ async function connect() {
     await send(msg);
   });
 
-  // 📉 DECREASE
+  // 📉 DECREASE (fixed fallback)
   router.on("ExecuteDecreasePosition", async (...args) => {
-    const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , , , , maybeEv] = args;
+    const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , , acceptablePrice, , maybeEv] = args;
     const ev = args[args.length - 1] || maybeEv;
     const collToken = path[path.length - 1];
     const p = await getPosition(vault, account, collToken, indexToken, isLong);
     const mark = await getTokenPrice(indexToken);
-    const deltaPct = mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
     const win = await getUserStats();
     const pair = sym(indexToken);
     const side = isLong ? "🟢 LONG" : "🔴 SHORT";
+
+    const entryPrice = p?.entry || Number(acceptablePrice) / 1e30;
+    const deltaPct = mark && entryPrice ? ((mark - entryPrice) / entryPrice) * 100 : null;
+    const collOut = collDelta ? usdFmt(collDelta) : p?.coll || "—";
+    const pnlText = p?.pnl || "⚪ —";
+
     const msg = `📉 <b>${pair} ${side}</b> | ${p?.lev || "—"}
-💰 Size Δ ${usdFmt(sizeDelta)} Coll Out ${usdFmt(collDelta)}
-🎯 Entry $${p?.entry?.toFixed(2) || "—"} 📊 Mark ${mark ? mark.toFixed(2) : "—"}${
+💰 Size Δ ${usdFmt(sizeDelta)} Coll Out ${collOut}
+🎯 Entry $${entryPrice?.toFixed(2) || "—"} 📊 Mark ${mark ? mark.toFixed(2) : "—"}${
       deltaPct ? ` (${deltaPct > 0 ? "🔼" : "🔽"}${deltaPct.toFixed(2)}%)` : ""
     }
-📈 PnL ${p?.pnl || "—"}
-🏅 Trader Win-Rate ${win ? `${win.rate}% (${win.wins} W / ${win.losses} L)` : "—"}
+📈 PnL ${pnlText}
+🏅 Trader Win-Rate ${win.rate}% (${win.wins} W / ${win.losses} L)
 📈 OI L ${stats.oiLong} OI S ${stats.oiShort}
 💹 24 h Vol ${stats.vol24h}
 👤 ${walletTag(account)}
@@ -264,7 +269,7 @@ async function connect() {
     await send(msg);
   });
 
-  // 💥 LIQUIDATION (with loss fallback)
+  // 💥 LIQUIDATION (loss fallback)
   vault.on(
     "LiquidatePosition",
     async (
@@ -282,9 +287,7 @@ async function connect() {
     ) => {
       const pair = sym(indexToken);
       let lossUsd = Math.abs(Number(realisedPnl) / 1e30);
-      if (lossUsd === 0 || !isFinite(lossUsd)) {
-        lossUsd = Number(collateral) / 1e30;
-      }
+      if (lossUsd === 0 || !isFinite(lossUsd)) lossUsd = Number(collateral) / 1e30;
       const lossPct =
         Number(collateral) > 0
           ? ((lossUsd / (Number(collateral) / 1e30)) * 100).toFixed(2)
@@ -311,7 +314,6 @@ ${pair} | ${isLong ? "LONG" : "SHORT"}
 
 // Heartbeat
 setInterval(() => console.log("💤 heartbeat"), 5 * 60 * 1000);
-
 connect().catch((e) => {
   console.error("❌ Fatal:", e);
   setTimeout(connect, 10000);
