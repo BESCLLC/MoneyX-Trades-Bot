@@ -140,7 +140,7 @@ async function getTokenPrice(token) {
   }
 }
 
-// ---- Updated trader win-rate (pulls from stats subgraph)
+// ---- Trader win-rate (from stats subgraph)
 const USER_QUERY = gql`
   {
     tradingStats(first: 1, orderBy: timestamp, orderDirection: desc) {
@@ -264,7 +264,7 @@ async function connect() {
     await send(msg);
   });
 
-  // 💥 LIQUIDATION
+  // 💥 LIQUIDATION (with loss fallback)
   vault.on(
     "LiquidatePosition",
     async (
@@ -281,7 +281,10 @@ async function connect() {
       ev
     ) => {
       const pair = sym(indexToken);
-      const lossUsd = Math.abs(Number(realisedPnl) / 1e30);
+      let lossUsd = Math.abs(Number(realisedPnl) / 1e30);
+      if (lossUsd === 0 || !isFinite(lossUsd)) {
+        lossUsd = Number(collateral) / 1e30;
+      }
       const lossPct =
         Number(collateral) > 0
           ? ((lossUsd / (Number(collateral) / 1e30)) * 100).toFixed(2)
