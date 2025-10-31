@@ -221,7 +221,9 @@ async function connect() {
 
   // 📈 INCREASE
   router.on("ExecuteIncreasePosition", async (...args) => {
-    const [account, path, indexToken, , , sizeDelta, isLong, , , , , , ev] = args;
+    // Keep your original array shape, but ensure ev is correct
+    const [account, path, indexToken, , , sizeDelta, isLong, , , , , , maybeEv] = args;
+    const ev = args[args.length - 1] || maybeEv; // ✅ safe event object
     const collToken = path[path.length - 1];
     const p = await getPosition(vault, account, collToken, indexToken, isLong);
     const mark = await getTokenPrice(indexToken);
@@ -239,13 +241,15 @@ async function connect() {
 📈 OI L ${stats.oiLong} OI S ${stats.oiShort}
 💹 24 h Vol ${stats.vol24h}
 👤 ${walletTag(account)}
-🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+🔗 <a href="https://bscscan.com/tx/${ev?.transactionHash || "unknown"}">tx</a>`;
     await send(msg);
   });
 
   // 📉 DECREASE
   router.on("ExecuteDecreasePosition", async (...args) => {
-    const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , , , , ev] = args;
+    // Keep your original array shape, but ensure ev is correct
+    const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , , , , maybeEv] = args;
+    const ev = args[args.length - 1] || maybeEv; // ✅ safe event object
     const collToken = path[path.length - 1];
     const p = await getPosition(vault, account, collToken, indexToken, isLong);
     const mark = await getTokenPrice(indexToken);
@@ -263,11 +267,11 @@ async function connect() {
 📈 OI L ${stats.oiLong} OI S ${stats.oiShort}
 💹 24 h Vol ${stats.vol24h}
 👤 ${walletTag(account)}
-🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+🔗 <a href="https://bscscan.com/tx/${ev?.transactionHash || "unknown"}">tx</a>`;
     await send(msg);
   });
 
-  // 💥 LIQUIDATION (improved)
+  // 💥 LIQUIDATION (improved) — signature kept EXACTLY with `ev` param
   vault.on(
     "LiquidatePosition",
     async (
@@ -295,7 +299,7 @@ ${pair} | ${isLong ? "LONG" : "SHORT"}
 💸 Mark $${(Number(markPrice) / 1e30).toFixed(2)} 💀 Loss −$${numFmt(lossUsd)} (${lossPct}%)
 📈 OI L ${(await getStats()).oiLong} OI S ${(await getStats()).oiShort}
 👤 ${walletTag(account)}
-🔗 <a href="https://bscscan.com/tx/${ev.transactionHash}">tx</a>`;
+🔗 <a href="https://bscscan.com/tx/${ev?.transactionHash || "unknown"}">tx</a>`;
       await send(msg);
     }
   );
