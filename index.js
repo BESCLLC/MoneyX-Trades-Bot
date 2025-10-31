@@ -140,27 +140,22 @@ async function getTokenPrice(token) {
   }
 }
 
-// ---- Updated trader win-rate (handles new traders)
+// ---- Updated trader win-rate (pulls from stats subgraph)
 const USER_QUERY = gql`
-  query ($id: String!) {
-    userStats(
-      where: { id: $id },
-      orderBy: timestamp,
-      orderDirection: desc,
-      first: 1
-    ) {
+  {
+    tradingStats(first: 1, orderBy: timestamp, orderDirection: desc) {
       profitCumulative
       lossCumulative
     }
   }
 `;
-async function getUserStats(addr) {
+async function getUserStats() {
   try {
-    const r = await request(ENDPOINTS.trades, USER_QUERY, { id: addr.toLowerCase() });
-    const u = r.userStats?.[0];
-    if (!u) return { rate: "0.0", wins: "0", losses: "0" };
-    const wins = Number(u.profitCumulative) / 1e30;
-    const losses = Number(u.lossCumulative) / 1e30;
+    const r = await request(ENDPOINTS.stats, USER_QUERY);
+    const t = r.tradingStats?.[0];
+    if (!t) return { rate: "0.0", wins: "0", losses: "0" };
+    const wins = Number(t.profitCumulative) / 1e30;
+    const losses = Number(t.lossCumulative) / 1e30;
     const rate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
     return { rate: rate.toFixed(1), wins: numFmt(wins), losses: numFmt(losses) };
   } catch {
@@ -221,14 +216,13 @@ async function connect() {
 
   // 📈 INCREASE
   router.on("ExecuteIncreasePosition", async (...args) => {
-    // Keep your original array shape, but ensure ev is correct
     const [account, path, indexToken, , , sizeDelta, isLong, , , , , , maybeEv] = args;
-    const ev = args[args.length - 1] || maybeEv; // ✅ safe event object
+    const ev = args[args.length - 1] || maybeEv;
     const collToken = path[path.length - 1];
     const p = await getPosition(vault, account, collToken, indexToken, isLong);
     const mark = await getTokenPrice(indexToken);
     const deltaPct = mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
-    const win = await getUserStats(account);
+    const win = await getUserStats();
     const pair = sym(indexToken);
     const side = isLong ? "🟢 LONG" : "🔴 SHORT";
     const msg = `📈 <b>${pair} ${side}</b> | ${p?.lev || "—"}
@@ -247,14 +241,13 @@ async function connect() {
 
   // 📉 DECREASE
   router.on("ExecuteDecreasePosition", async (...args) => {
-    // Keep your original array shape, but ensure ev is correct
     const [account, path, indexToken, collDelta, sizeDelta, isLong, , , , , , , maybeEv] = args;
-    const ev = args[args.length - 1] || maybeEv; // ✅ safe event object
+    const ev = args[args.length - 1] || maybeEv;
     const collToken = path[path.length - 1];
     const p = await getPosition(vault, account, collToken, indexToken, isLong);
     const mark = await getTokenPrice(indexToken);
     const deltaPct = mark && p?.entry ? ((mark - p.entry) / p.entry) * 100 : null;
-    const win = await getUserStats(account);
+    const win = await getUserStats();
     const pair = sym(indexToken);
     const side = isLong ? "🟢 LONG" : "🔴 SHORT";
     const msg = `📉 <b>${pair} ${side}</b> | ${p?.lev || "—"}
@@ -271,7 +264,7 @@ async function connect() {
     await send(msg);
   });
 
-  // 💥 LIQUIDATION (improved) — signature kept EXACTLY with `ev` param
+  // 💥 LIQUIDATION
   vault.on(
     "LiquidatePosition",
     async (
@@ -304,7 +297,6 @@ ${pair} | ${isLong ? "LONG" : "SHORT"}
     }
   );
 
-  // Reconnect
   if (provider._ws) {
     provider._ws.on("close", () => {
       console.error("⚠️ WS closed – reconnecting in 5 s…");
